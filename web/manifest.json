@@ -1,6 +1,6 @@
 {
-    "name": "blinkpay_mobile_app_demo",
-    "short_name": "blinkpay_mobile_app_demo",
+    "name": "blinkpay_flutter_demo",
+    "short_name": "blinkpay_flutter_demo",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

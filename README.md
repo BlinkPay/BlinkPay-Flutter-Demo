@@ -1,4 +1,4 @@
-# blinkpay_mobile_app_demo
+# blinkpay_flutter_demo
 
 A Flutter project showcasing how to use WebView for e-commerce functionality with the BlinkPay payment gateway.
 
@@ -21,7 +21,7 @@ Edit `android/app/src/main/AndroidManifest.xml` to include uses-permission and t
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <application
-            android:label="blinkpay_mobile_app_demo"
+            android:label="blinkpay_flutter_demo"
             android:name="${applicationName}"
             android:icon="@mipmap/ic_launcher">
         <activity

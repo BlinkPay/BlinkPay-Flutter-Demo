@@ -1,10 +1,10 @@
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.14)
-project(blinkpay_mobile_app_demo LANGUAGES CXX)
+project(blinkpay_flutter_demo LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "blinkpay_mobile_app_demo")
+set(BINARY_NAME "blinkpay_flutter_demo")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
