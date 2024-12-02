@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'package:app_links/app_links.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -128,14 +129,39 @@ class _WebViewExampleState extends State<WebViewExample> {
     try {
       final uri = Uri.parse(url);
       // Attempt to launch URL in external app
-      bool launched =
-          await launchUrl(uri, mode: LaunchMode.externalNonBrowserApplication);
-      if (!launched) {
-        // If launch fails, load in WebView
-        launched = await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
-        if (!launched) {
-          throw Exception('Failed to launch URL with in-app browser view: $uri');
+      if (Platform.isAndroid) {
+        // Try to launch in external app only
+        bool canLaunch = await canLaunchUrl(uri);
+        debugPrint('Can launch URL? $canLaunch');
+
+        if (!canLaunch) {
+          debugPrint('No app can handle this URL, falling back to WebView');
+          _loadUrlInWebView(url);
+          return;
         }
+
+        bool launched = await launchUrl(uri,
+            mode: LaunchMode.externalNonBrowserApplication);
+
+        if (!launched) {
+          debugPrint('Launch failed, falling back to WebView');
+          _loadUrlInWebView(url);
+        }
+      } else if (Platform.isIOS) {
+        // iOS handling remains the same
+        bool launched = await launchUrl(uri,
+            mode: LaunchMode.externalNonBrowserApplication);
+
+        if (!launched) {
+          debugPrint('iOS launch failed, trying inAppBrowserView');
+          launched = await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
+          if (!launched) {
+            throw Exception(
+                'Failed to launch URL with in-app browser view: $uri');
+          }
+        }
+      } else {
+        throw Exception('Unsupported platform');
       }
     } catch (e) {
       debugPrint('Error launching URL: $e');
@@ -199,6 +225,7 @@ class _WebViewExampleState extends State<WebViewExample> {
   void _handleWebViewClose(String navUrl) {
     setState(() {
       _showWebView = false;
+      _isHandlingInWebView = false;
     });
     showDialog(
       context: context,

@@ -25,8 +25,8 @@ Ensure you have the following installed:
 
 1. Clone the Repository:
 ```bash
-git clone https://github.com/BlinkPay/blinkPay_flutter_mobile_app_demo
-cd blinkPay_flutter_mobile_app_demo
+git clone https://github.com/BlinkPay/blinkpay_flutter_mobile_app_demo
+cd blinkpay_flutter_mobile_app_demo
 ```
 
 2. Install Dependencies:
