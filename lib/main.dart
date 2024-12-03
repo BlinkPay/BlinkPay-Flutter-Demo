@@ -1,29 +1,25 @@
 import 'dart:async';
 import 'dart:io' show Platform;
-import 'package:app_links/app_links.dart';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import './blinkpay_service.dart';
+import './env.dart';
 
-/// Configuration values and constants used throughout the app
-class AppConfig {
-  // BlinkPay URLs and endpoints
-  static const String blinkPayUrl = 'https://acme-prod.blinkpay.co.nz';
-  static const String apiUrl = 'debit.blinkpay.co.nz';
-  static const String deepLinkUrl = 'blinkpay://test-app/return';
+// List of external bank URLs that should open in external browser
+const List<String> externalUrls = [
+  'https://bank.westpac.co.nz',
+  'https://links.anz.co.nz',
+  'https://online.asb.co.nz'
+];
 
-  // List of external bank URLs that should open in external browser
-  static const List<String> externalUrls = [
-    'https://bank.westpac.co.nz',
-    'https://links.anz.co.nz',
-    'https://online.asb.co.nz'
-  ];
+void main() async {
+  await dotenv.load(fileName: ".env");
+  runApp(const MaterialApp(home: WebViewExample()));
 }
-
-void main() => runApp(const MaterialApp(home: WebViewExample()));
 
 class WebViewExample extends StatefulWidget {
   const WebViewExample({super.key});
@@ -33,41 +29,24 @@ class WebViewExample extends StatefulWidget {
 }
 
 class _WebViewExampleState extends State<WebViewExample> {
-  // Controllers and subscriptions
+  final BlinkPayService _blinkPayService = BlinkPayService();
+  String? _currentPaymentId;
+
+  bool _isInitiatingPayment = false;
+
   late final WebViewController _controller;
-  late AppLinks _appLinks;
   late StreamSubscription _sub;
 
-  // State management flags
   bool _showWebView = false;
-  bool _isLoading = true;
-  bool _isHandlingInWebView = false;
+  bool _isLoading = false;
 
   @override
   void initState() {
     super.initState();
-    _setupDeepLinks();
     _setupWebView();
   }
 
-  /// Setup deep link handling for bank redirects
-  Future<void> _setupDeepLinks() async {
-    _appLinks = AppLinks();
-    _sub = _appLinks.uriLinkStream.listen((link) {
-      _handleDeepLink(link);
-    }, onError: (err) {
-      debugPrint('Error handling deep link: $err');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error handling deep link: $err')),
-        );
-      }
-    });
-  }
-
-  /// Configure WebView with security and platform-specific settings
   void _setupWebView() {
-    // Handle platform-specific WebView params
     final PlatformWebViewControllerCreationParams params =
         (WebViewPlatform.instance is WebKitWebViewPlatform)
             ? WebKitWebViewControllerCreationParams(
@@ -90,34 +69,31 @@ class _WebViewExampleState extends State<WebViewExample> {
           },
           onWebResourceError: (error) {
             debugPrint('Web resource error: ${error.description}');
-            setState(() => _isLoading = false); // Ensure loading state is reset
+            setState(() => _isLoading = false);
             _handleApiError('Failed to load page: ${error.description}');
           },
           onNavigationRequest: (NavigationRequest request) {
             final url = request.url;
-            // If we're intentionally loading in WebView, allow navigation
-            if (_isHandlingInWebView) {
-              return NavigationDecision.navigate;
-            }
+            debugPrint('Navigating to: $url');
 
-            // Handle redirect URLs from BlinkPay
-            if (url.startsWith('${AppConfig.blinkPayUrl}/redirect?cid=')) {
-              _handleWebViewClose(url);
+            // Handle redirect back to app
+            if (url.startsWith(Environment.redirectUri)) {
+              _handleWebViewClose();
               return NavigationDecision.prevent;
             }
 
             // Handle external bank URLs
-            if (AppConfig.externalUrls
+            if (externalUrls
                 .any((externalUrl) => url.startsWith(externalUrl))) {
               _handleExternalUrl(url);
               return NavigationDecision.prevent;
             }
+
             return NavigationDecision.navigate;
           },
         ),
       );
 
-    // Enable debugging for Android WebView in debug mode
     if (_controller.platform is AndroidWebViewController) {
       AndroidWebViewController.enableDebugging(true);
       (_controller.platform as AndroidWebViewController)
@@ -125,12 +101,37 @@ class _WebViewExampleState extends State<WebViewExample> {
     }
   }
 
+  Future<void> _initiatePayment() async {
+    if (_isInitiatingPayment) {
+      debugPrint('Payment initiation already in progress');
+      return;
+    }
+
+    _isInitiatingPayment = true;
+
+    try {
+      setState(() => _isLoading = true);
+      debugPrint('Creating payment...'); 
+
+      final payment = await _blinkPayService.createQuickPayment("0.01");
+      _currentPaymentId = payment['quick_payment_id'];
+
+      await _controller.clearCache();
+      setState(() => _showWebView = true);
+      await _controller.loadRequest(Uri.parse("about:blank"));
+      await _controller.loadRequest(Uri.parse(payment['redirect_uri']));
+    } catch (e) {
+      _handleApiError('Failed to initiate payment: $e');
+    } finally {
+      setState(() => _isLoading = false);
+      _isInitiatingPayment = false;
+    }
+  }
+
   Future<void> _handleExternalUrl(String url) async {
     try {
       final uri = Uri.parse(url);
-      // Attempt to launch URL in external app
       if (Platform.isAndroid) {
-        // Try to launch in external app only
         bool canLaunch = await canLaunchUrl(uri);
         debugPrint('Can launch URL? $canLaunch');
 
@@ -148,20 +149,16 @@ class _WebViewExampleState extends State<WebViewExample> {
           _loadUrlInWebView(url);
         }
       } else if (Platform.isIOS) {
-        // iOS handling remains the same
         bool launched = await launchUrl(uri,
             mode: LaunchMode.externalNonBrowserApplication);
 
         if (!launched) {
-          debugPrint('iOS launch failed, trying inAppBrowserView');
           launched = await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
           if (!launched) {
             throw Exception(
                 'Failed to launch URL with in-app browser view: $uri');
           }
         }
-      } else {
-        throw Exception('Unsupported platform');
       }
     } catch (e) {
       debugPrint('Error launching URL: $e');
@@ -171,75 +168,60 @@ class _WebViewExampleState extends State<WebViewExample> {
     }
   }
 
-  /// Load URL in WebView with error handling
   void _loadUrlInWebView(String url) {
-    _isHandlingInWebView = true; // Set flag before loading
     _controller.loadRequest(Uri.parse(url)).catchError((error) {
       debugPrint('Error loading URL in WebView: $error');
       _handleApiError('Failed to load page');
     });
   }
 
-  /// Process incoming deep links from bank redirects
-  void _handleDeepLink(Uri link) {
-    if (!link.hasAbsolutePath || !Uri.parse(link.toString()).isAbsolute) {
-      debugPrint('Invalid link received');
+  Future<void> _checkPaymentStatus() async {
+    if (_currentPaymentId == null) {
       return;
     }
-    if (link.toString().startsWith(AppConfig.deepLinkUrl)) {
-      _handleWebViewClose(link.toString());
-      _sendParametersToApi(link.queryParameters);
-    }
-  }
 
-  /// Send query parameters back to BlinkPay API after bank redirect
-  Future<void> _sendParametersToApi(Map<String, String> parameters) async {
+    _showSnackBar(true, 'Checking payment...');
+
     try {
-      final url = Uri.https(AppConfig.apiUrl, '/bank/1.0/return', parameters);
-      final response = await http.get(url).timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw TimeoutException('API request timed out'),
-          );
-
-      if (response.statusCode == 200) {
-        debugPrint('Parameters sent successfully');
-      } else {
-        _handleApiError('Failed to send parameters: ${response.statusCode}');
-      }
+      await _blinkPayService.waitForPaymentCompletion(_currentPaymentId!);
+      _showSnackBar(true, 'Payment completed successfully');
     } catch (e) {
-      _handleApiError('Error sending parameters: $e');
+      if (e is PaymentCheckException) {
+        _showSnackBar(false, e.toString());
+      } else {
+        _showSnackBar(false, 'Payment was not completed');
+      }
     }
   }
 
-  /// Handle and display API errors
-  void _handleApiError(String message) {
-    debugPrint(message);
+  void _showSnackBar(bool success, String message) {
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.hideCurrentSnackBar(); // if any
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: success ? Colors.green : Colors.red,
+          duration: const Duration(seconds: 3),
+        ),
       );
     }
   }
 
-  /// Handle WebView closure and display navigation URL
-  void _handleWebViewClose(String navUrl) {
+  void _handleApiError(String message) {
+    debugPrint(message);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  void _handleWebViewClose() {
     setState(() {
       _showWebView = false;
-      _isHandlingInWebView = false;
     });
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Closing WebView'),
-        content: Text('Navigation URL: ' + navUrl),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    );
+    _checkPaymentStatus();
   }
 
   @override
@@ -251,18 +233,16 @@ class _WebViewExampleState extends State<WebViewExample> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.green,
+      backgroundColor: Colors.white,
       appBar: AppBar(
-        title: const Text('Acme Mobile App'),
+        title: const Text('BlinkPay Demo'),
         actions: _showWebView
             ? [
                 IconButton(
                   icon: const Icon(Icons.close),
                   iconSize: 24,
                   onPressed: () {
-                    setState(() => _showWebView = false);
-                    // Reset WebView to initial state
-                    _controller.loadRequest(Uri.parse(AppConfig.blinkPayUrl));
+                    _handleWebViewClose();
                   },
                 ),
               ]
@@ -279,13 +259,9 @@ class _WebViewExampleState extends State<WebViewExample> {
             )
           : Center(
               child: ElevatedButton.icon(
-                onPressed: () {
-                  setState(() => _showWebView = true);
-                  // Reload initial page when showing WebView
-                  _controller.loadRequest(Uri.parse(AppConfig.blinkPayUrl));
-                },
+                onPressed: _initiatePayment,
                 icon: const Icon(Icons.shopping_cart),
-                label: const Text('View Shopping Cart in WebView'),
+                label: const Text('Pay with BlinkPay'),
               ),
             ),
     );

@@ -52,20 +52,21 @@ sudo gem install cocoapods
 
 ### Configuration
 
-#### Deep Linking Setup
-Note: This demo app already includes deep linking configuration. If you're creating your own implementation, ensure your Android Manifest (`android/app/src/main/AndroidManifest.xml`) includes:
+#### BlinkPay Configuration
 
-```xml
-<uses-permission android:name="android.permission.INTERNET" />
-<!-- Deep Link Configuration -->
-<intent-filter>
-    <action android:name="android.intent.action.VIEW"/>
-    <category android:name="android.intent.category.DEFAULT"/>
-    <category android:name="android.intent.category.BROWSABLE"/>
-    <data android:scheme="blinkpay" 
-          android:host="test-app" 
-          android:pathPrefix="/return"/>
-</intent-filter>
+1. Log into [BlinkPay Merchant Portal](https://merchants.blinkpay.co.nz/settings/api)
+2. Navigate to your app under Settings/API
+3. Add your Redirect URI e.g. `blinkpay://test-app/return` to your whitelist redirect URLs and save
+4. Copy the API key and generate a new secret using "Rotate Secret"
+
+#### Environment Configuration
+
+Create a `.env` file at the root of your project:
+```
+BLINKPAY_API_URL=https://sandbox.debit.blinkpay.co.nz # Use https://debit.blinkpay.co.nz for production
+BLINKPAY_CLIENT_ID=<your_blinkpay_api_key>
+BLINKPAY_CLIENT_SECRET=<your_blinkpay_secret>
+APP_REDIRECT_URI=blinkpay://test-app/return
 ```
 
 ## Running the Application

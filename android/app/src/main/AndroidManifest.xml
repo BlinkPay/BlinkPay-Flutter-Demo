@@ -1,4 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.blinkpay_flutter_mobile_app_demo">
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="blinkpay_flutter_mobile_app_demo"
         android:name="${applicationName}"
@@ -26,10 +27,11 @@
             </intent-filter>
 
             <!-- Deep Link Configuration -->
-            <intent-filter>
+            <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW"/>
                 <category android:name="android.intent.category.DEFAULT"/>
                 <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="https" />
                 <data android:scheme="blinkpay" android:host="test-app" android:pathPrefix="/return"/>
             </intent-filter>
         </activity>
@@ -48,6 +50,12 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- Add URL handling capability -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
         </intent>
     </queries>
 </manifest>
