@@ -3,10 +3,8 @@
 <plist version="1.0">
 <dict>
 	<!-- Allow web connections from the app -->
-	<key>NSAppTransportSecurity</key>
+	<!-- <key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
 		<key>NSExceptionDomains</key>
 		<dict>
 			<key>debit.blinkpay.co.nz</key>
@@ -23,7 +21,7 @@
 				<key>NSExceptionMinimumTLSVersion</key>
 				<string>TLSv1.2</string>
 			</dict>
-		</dict>
+		</dict> -->
 	</dict>
     
     <!-- URL Scheme for Deep Linking -->
