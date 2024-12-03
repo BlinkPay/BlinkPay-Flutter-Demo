@@ -69,7 +69,72 @@ BLINKPAY_CLIENT_SECRET=<your_blinkpay_secret>
 APP_REDIRECT_URI=blinkpay://test-app/return
 ```
 
+### Required Manifest Configurations
+
+The below lists general app configurations needed to connect to our API and use the service. These have already been included in the codebase but are noted here in case you are creating your own app.
+
+#### Android Configuration
+
+```xml
+<!-- Add this permission at the top level -->
+<uses-permission android:name="android.permission.INTERNET"/>
+
+<!-- Add this queries section for URL handling capability -->
+<queries>
+    <intent>
+        <action android:name="android.intent.action.VIEW" />
+        <category android:name="android.intent.category.BROWSABLE" />
+        <data android:scheme="https" />
+    </intent>
+</queries>
+```
+
+If you're using a custom URL scheme for payment redirects (e.g., `blinkpay://`), you'll need to add the following configurations to your app:
+
+```xml
+<!-- Inside the <activity> tag, add this intent filter for URL scheme handling -->
+<intent-filter>
+    <action android:name="android.intent.action.VIEW"/>
+    <category android:name="android.intent.category.DEFAULT"/>
+    <category android:name="android.intent.category.BROWSABLE"/>
+    <data android:scheme="blinkpay" android:host="test-app" android:pathPrefix="/return"/>
+</intent-filter>
+```
+
+Note: Replace with your actual bundle identifier.
+
+#### iOS Configuration
+
+If you're using a custom URL scheme for payment redirects (e.g., `blinkpay://`), you'll need to add this URL scheme configuration to your `ios/Runner/Info.plist`:
+
+```
+<key>CFBundleURLTypes</key>
+<array>
+    <dict>
+        <key>CFBundleURLSchemes</key>
+        <array>
+            <string>blinkpay</string>
+        </array>
+        <key>CFBundleURLName</key>
+        <string>com.example.blinkpay</string>
+    </dict>
+</array>
+```
+
+Note: Replace with your actual bundle identifier.
+
+
 ## Running the Application
+
+Before running the application, you need to set up your development environment with an emulator or physical device:
+
+Ensure you have either:
+- An Android emulator running (via Android Studio's Device Manager)
+- An iOS simulator running (via Xcode's Developer Tools)
+- A physical device connected with USB debugging enabled
+
+See Flutter's device setup guides for [macOS](https://docs.flutter.dev/get-started/install/macos#set-up-your-android-device), [Windows](https://docs.flutter.dev/get-started/install/windows#set-up-your-android-device), or [Linux](https://docs.flutter.dev/get-started/install/linux#set-up-your-android-device).
+
 
 Run the app in debug mode:
 ```bash
