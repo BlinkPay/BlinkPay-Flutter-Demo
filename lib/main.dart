@@ -113,7 +113,14 @@ class _WebViewExampleState extends State<WebViewExample> {
       setState(() => _isLoading = true);
       debugPrint('Creating payment...'); 
 
-      final payment = await _blinkPayService.createQuickPayment("0.01");
+      PCR pcr = PCR(
+        particulars: 'TestPayment',
+        code: 'CODE001',
+        reference: 'REF001'
+      );
+      String amount = '0.01';
+      
+      final payment = await _blinkPayService.createQuickPayment(pcr, amount);
       _currentPaymentId = payment['quick_payment_id'];
 
       await _controller.clearCache();

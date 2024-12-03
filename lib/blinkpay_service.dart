@@ -12,9 +12,26 @@ class Status {
   static const String pending = 'Pending';
   static const String inProcess = 'AcceptedSettlementInProcess';
   static const String gatewayTimeout = 'GatewayTimeout';
-  static const String gatewayAwaitingSubmittion = 'GatewayAwaitingSubmission';
+  static const String gatewayAwaitingSubmission = 'GatewayAwaitingSubmission';
   static const String authorised = 'Authorised';
   static const String awaitingAuthorisation = 'AwaitingAuthorisation';
+}
+
+class PCR {
+  final String particulars;
+  final String? code;
+  final String? reference;
+
+  /// Creates a PCR object with required particulars and optional code and reference.
+  PCR({
+    required this.particulars,
+    this.code,
+    this.reference,
+  });
+
+  String get truncatedParticulars => particulars.substring(0, particulars.length.clamp(0, 12));
+  String? get truncatedCode => code?.substring(0, code!.length.clamp(0, 12));
+  String? get truncatedReference => reference?.substring(0, reference!.length.clamp(0, 12));
 }
 
 class PaymentCheckException implements Exception {
@@ -26,7 +43,7 @@ class PaymentCheckException implements Exception {
 }
 
 class BlinkPayService {
-  static const int maxStatusChecks = 5;
+  static const int maxStatusChecks = 10;
   static const Duration checkInterval = Duration(seconds: 1);
 
   String? _accessToken;
@@ -77,7 +94,7 @@ class BlinkPayService {
     }
   }
 
-  Future<Map<String, dynamic>> createQuickPayment(String amount) async {
+  Future<Map<String, dynamic>> createQuickPayment(PCR pcr, String amount) async {
     final token = await _getToken();
     debugPrint('Creating BlinkPay payment');
     final response = await http.post(
@@ -95,9 +112,9 @@ class BlinkPayService {
           }
         },
         'pcr': {
-          'particulars': 'TestPayment',
-          'reference': 'REF001',
-          'code': 'CODE001'
+          'particulars': pcr.truncatedParticulars,
+          'reference': pcr.truncatedReference,
+          'code': pcr.truncatedCode
         },
         'amount': {
           'total': amount,
@@ -129,7 +146,7 @@ class BlinkPayService {
         } else if (consentOrPaymentStatus == Status.rejected || consentOrPaymentStatus == Status.revoked || consentOrPaymentStatus == Status.gatewayTimeout) {
           await _handleFailedPayment(quickPaymentId);
           throw PaymentCheckException('Payment was not completed');
-        } else if (consentOrPaymentStatus == Status.gatewayAwaitingSubmittion || consentOrPaymentStatus == Status.awaitingAuthorisation || consentOrPaymentStatus == Status.authorised) {
+        } else if (consentOrPaymentStatus == Status.gatewayAwaitingSubmission || consentOrPaymentStatus == Status.awaitingAuthorisation || consentOrPaymentStatus == Status.authorised) {
           bool wasRevoked = await _handleFailedPayment(quickPaymentId);
           if (!wasRevoked) {
             // The payment might have compelted, check the status again 
@@ -192,8 +209,8 @@ class BlinkPayService {
       return true; // Ignore 409 as payment is already revoked
     }
 
-    if (response.statusCode == 409) {
-      return false; // Ignore 409 as payment is already revoked
+    if (response.statusCode == 422) {
+      return false; // A response code of 422 indicates the payment might have already completed
     }
     
     if (response.statusCode != 204) {
