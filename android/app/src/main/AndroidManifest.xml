@@ -1,7 +1,7 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.blinkpay_flutter_mobile_app_demo">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="nz.co.blinkpay_flutter_demo">
     <uses-permission android:name="android.permission.INTERNET"/>
     <application
-        android:label="blinkpay_flutter_mobile_app_demo"
+        android:label="blinkpay_flutter_demo"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

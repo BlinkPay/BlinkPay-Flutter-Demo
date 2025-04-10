@@ -1,4 +1,4 @@
-package com.example.blinkpay_flutter_mobile_app_demo
+package nz.co.blinkpay_flutter_demo
 
 import io.flutter.embedding.android.FlutterActivity
 

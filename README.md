@@ -1,12 +1,12 @@
-# BlinkPay Flutter Mobile App Demo
+# BlinkPay Flutter Demo
 
-A Flutter project showcasing how to integrate WebView-based e-commerce functionality with the BlinkPay payment gateway. This project demonstrates a mobile implementation of BlinkPay's payment system using Flutter's WebView capabilities and deep linking for seamless payment flow.
+A Flutter project showcasing how to integrate Custom Tabs-based e-commerce functionality with the BlinkPay payment gateway. This project demonstrates a mobile implementation of BlinkPay's payment system using Flutter's Custom Tabs capabilities and deep linking for seamless payment flow.
 
 ## Tools & Technologies
 
 - **Flutter**: Cross-platform framework for building mobile applications
-- **WebView**: For rendering web-based payment interfaces
-- **Deep Linking**: To handle payment callbacks and app navigation
+- **Custom Tabs**: For rendering web-based payment interfaces using system browser
+- **Deep Linking**: To handle payment callbacks and app navigation using `app_links`
 - **BlinkPay**: Secure payment gateway integration for processing payments
 
 ## Prerequisites
@@ -25,8 +25,8 @@ Ensure you have the following installed:
 
 1. Clone the Repository:
 ```bash
-git clone https://github.com/BlinkPay/blinkpay_flutter_mobile_app_demo
-cd blinkpay_flutter_mobile_app_demo
+git clone https://github.com/BlinkPay/blinkpay_flutter_demo
+cd blinkpay_flutter_demo
 ```
 
 2. Install Dependencies:
@@ -123,7 +123,6 @@ If you're using a custom URL scheme for payment redirects (e.g., `blinkpay://`),
 
 Note: Replace with your actual bundle identifier.
 
-
 ## Running the Application
 
 Before running the application, you need to set up your development environment with an emulator or physical device:
@@ -135,11 +134,18 @@ Ensure you have either:
 
 See Flutter's device setup guides for [macOS](https://docs.flutter.dev/get-started/install/macos#set-up-your-android-device), [Windows](https://docs.flutter.dev/get-started/install/windows#set-up-your-android-device), or [Linux](https://docs.flutter.dev/get-started/install/linux#set-up-your-android-device).
 
-
 Run the app in debug mode:
 ```bash
 flutter run
 ```
+
+## APK Build
+
+To build an APK:
+```bash
+flutter build apk --release
+```
+
 ## Contributing
 
 We welcome contributions from the community! Your pull request will be reviewed by our team.
