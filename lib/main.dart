@@ -2,7 +2,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_custom_tabs/flutter_custom_tabs.dart' as custom_tabs;
-import 'package:url_launcher/url_launcher.dart' as url_launcher;
 import 'package:app_links/app_links.dart';
 
 import './blinkpay_service.dart';
@@ -60,11 +59,6 @@ class BlinkPayDemo extends StatefulWidget {
 
 class _BlinkPayDemoState extends State<BlinkPayDemo> {
   final BlinkPayService _blinkPayService = BlinkPayService();
-  final List<String> externalUrls = const [
-    'https://bank.westpac.co.nz',
-    'https://links.anz.co.nz',
-    'https://online.asb.co.nz',
-  ];
 
   String? _currentPaymentId;
   bool _isInitiatingPayment = false;
@@ -129,17 +123,6 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> {
     final uri = Uri.parse(url);
 
     try {
-      if (externalUrls.any((external) => url.startsWith(external))) {
-        final launched = await url_launcher.launchUrl(
-          uri,
-          mode: url_launcher.LaunchMode.externalApplication,
-        );
-        if (!launched) {
-          _handleApiError('Could not launch external URL: $url');
-        }
-        return;
-      }
-
       await custom_tabs.launchUrl(
         uri,
         customTabsOptions: custom_tabs.CustomTabsOptions(
