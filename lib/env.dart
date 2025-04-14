@@ -17,6 +17,9 @@ class Environment {
   static String get redirectUri => 
     dotenv.env['APP_REDIRECT_URI'] ?? 'blinkpay://test-app/return';
 
+  static String get unitPrice =>
+    dotenv.env['UNIT_PRICE'] ?? '1.00';
+
   // Helper method to validate environment
   static bool isValid() {
     return clientId.isNotEmpty && 

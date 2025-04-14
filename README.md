@@ -116,7 +116,7 @@ If you're using a custom URL scheme for payment redirects (e.g., `blinkpay://`),
             <string>blinkpay</string>
         </array>
         <key>CFBundleURLName</key>
-        <string>com.example.blinkpay</string>
+        <string>nz.co.blinkpay</string>
     </dict>
 </array>
 ```

@@ -11,14 +11,19 @@
                 <string>blinkpay</string>
             </array>
             <key>CFBundleURLName</key>
-            <string>com.example.blinkpay</string>
+            <string>nz.co.blinkpay</string>
         </dict>
+    </array>
+
+    <key>LSApplicationQueriesSchemes</key>
+    <array>
+      <string>blinkpay</string>
     </array>
 
     <key>CFBundleDevelopmentRegion</key>
     <string>$(DEVELOPMENT_LANGUAGE)</string>
     <key>CFBundleDisplayName</key>
-    <string>Blinkpay Mobile App Demo</string>
+    <string>Blinkpay Flutter Demo</string>
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleIdentifier</key>

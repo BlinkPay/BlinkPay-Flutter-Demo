@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'package:intl/intl.dart';
 
 import './env.dart';
 
@@ -96,7 +98,7 @@ class BlinkPayService {
 
   Future<Map<String, dynamic>> createQuickPayment(PCR pcr, String amount) async {
     final token = await _getToken();
-    debugPrint('Creating BlinkPay payment');
+    debugPrint('Creating BlinkPay quick payment');
     final response = await http.post(
       Uri.parse('https://${Environment.blinkPayApiUrl}/payments/v1/quick-payments'),
       headers: {
@@ -104,7 +106,6 @@ class BlinkPayService {
         'Content-Type': 'application/json',
       },
       body: jsonEncode({
-        'type': 'single',
         'flow': {
           'detail': {
             'type': 'gateway',
@@ -126,9 +127,125 @@ class BlinkPayService {
     if (response.statusCode == 201) {
       return jsonDecode(response.body);
     }
-    throw Exception('Failed to create payment: ${response.statusCode}');
+    throw Exception('Failed to create quick payment: ${response.statusCode}');
   }
 
+  Future<Map<String, dynamic>> createSingleConsent(PCR pcr, String amount) async {
+    final token = await _getToken();
+    debugPrint('Creating BlinkPay single consent');
+    final response = await http.post(
+      Uri.parse('https://${Environment.blinkPayApiUrl}/payments/v1/single-consents'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'flow': {
+          'detail': {
+            'type': 'gateway',
+            'redirect_uri': Environment.redirectUri,
+          }
+        },
+        'pcr': {
+          'particulars': pcr.truncatedParticulars,
+          'reference': pcr.truncatedReference,
+          'code': pcr.truncatedCode
+        },
+        'amount': {
+          'total': amount,
+          'currency': 'NZD'
+        }
+      }),
+    );
+
+    if (response.statusCode == 201) {
+      return jsonDecode(response.body);
+    }
+    throw Exception('Failed to create single consent: ${response.statusCode}');
+  }
+
+  Future<Map<String, dynamic>> createEnduringConsent(String maxAmountPeriod, String maxAmountPayment) async {
+    final auckland = tz.getLocation('Pacific/Auckland');
+    final nowInAuckland = tz.TZDateTime.now(auckland);
+
+    final baseFormat = DateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS");
+    final baseFormatted = baseFormat.format(nowInAuckland);
+
+    final offset = nowInAuckland.timeZoneOffset;
+    final hours = offset.inHours.abs().toString().padLeft(2, '0');
+    final minutes = (offset.inMinutes.abs() % 60).toString().padLeft(2, '0');
+    final sign = offset.isNegative ? '-' : '+';
+    final offsetStr = '$sign$hours:$minutes';
+
+    final formattedDate = '$baseFormatted$offsetStr';
+
+    final token = await _getToken();
+    debugPrint('Creating BlinkPay enduring consent');
+    final response = await http.post(
+      Uri.parse('https://${Environment.blinkPayApiUrl}/payments/v1/enduring-consents'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'flow': {
+          'detail': {
+            'type': 'gateway',
+            'redirect_uri': Environment.redirectUri,
+          }
+        },
+        'maximum_amount_period': {
+          'total': maxAmountPeriod,
+          'currency': 'NZD'
+        },
+        'period': 'fortnightly',
+        'from_timestamp': formattedDate,
+        'maximum_amount_payment': {
+          'total': maxAmountPayment,
+          'currency': 'NZD'
+        }
+      }),
+    );
+
+    if (response.statusCode == 201) {
+      return jsonDecode(response.body);
+    }
+    throw Exception('Failed to create enduring consent: ${response.statusCode}');
+  }
+
+  Future<Map<String, dynamic>> createPayment(String consentId, { PCR? pcr, String? amount }) async {
+    final token = await _getToken();
+    debugPrint('Creating BlinkPay payment');
+
+    final Map<String, dynamic> payload = {
+      'consent_id': consentId,
+      if (pcr != null && amount != null) ...{
+        'pcr': {
+          'particulars': pcr.truncatedParticulars,
+          'reference': pcr.truncatedReference,
+          'code': pcr.truncatedCode,
+        },
+        'amount': {
+          'total': amount,
+          'currency': 'NZD',
+        },
+      },
+    };
+
+    final response = await http.post(
+      Uri.parse('https://${Environment.blinkPayApiUrl}/payments/v1/payments'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode(payload),
+    );
+
+    if (response.statusCode == 201) {
+      return jsonDecode(response.body);
+    }
+    throw Exception('Failed to create payment: ${response.statusCode}');
+  }
 
   Future<void> waitForPaymentCompletion(String quickPaymentId) async {
     int checkCount = 0;
@@ -149,7 +266,7 @@ class BlinkPayService {
         } else if (consentOrPaymentStatus == Status.gatewayAwaitingSubmission || consentOrPaymentStatus == Status.awaitingAuthorisation || consentOrPaymentStatus == Status.authorised) {
           bool wasRevoked = await _handleFailedPayment(quickPaymentId);
           if (!wasRevoked) {
-            // The payment might have compelted, check the status again 
+            // The payment might have completed, check the status again
             continue;
           }
           throw PaymentCheckException('Payment was not submitted');
@@ -196,6 +313,51 @@ class BlinkPayService {
       return data['consent']['status'];
     }
     throw Exception('Failed to get payment status: ${response.statusCode}');
+  }
+
+  Future<Map<String, dynamic>> getQuickPayment(String consentId) async {
+    final token = await _getToken();
+
+    debugPrint('Retrieving BlinkPay quick payment');
+    final response = await http.get(
+      Uri.parse('https://${Environment.blinkPayApiUrl}/payments/v1/quick-payments/$consentId'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    }
+    throw Exception('Failed to fetch quick payment: ${response.statusCode}');
+  }
+
+  Future<Map<String, dynamic>> getSingleConsent(String consentId) async {
+    final token = await _getToken();
+
+    debugPrint('Retrieving BlinkPay single consent');
+    final response = await http.get(
+      Uri.parse('https://${Environment.blinkPayApiUrl}/payments/v1/single-consents/$consentId'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    }
+    throw Exception('Failed to fetch single consent: ${response.statusCode}');
+  }
+
+  Future<Map<String, dynamic>> getEnduringConsent(String consentId) async {
+    final token = await _getToken();
+
+    debugPrint('Retrieving BlinkPay enduring consent');
+    final response = await http.get(
+      Uri.parse('https://${Environment.blinkPayApiUrl}/payments/v1/enduring-consents/$consentId'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    }
+    throw Exception('Failed to fetch enduring consent: ${response.statusCode}');
   }
 
   Future<bool> revokePayment(String quickPaymentId) async {
