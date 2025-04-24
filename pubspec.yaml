@@ -1,5 +1,5 @@
-name: blinkpay_flutter_mobile_app_demo
-description: "A project demonstrating a BlinkPay WebView."
+name: blinkpay_flutter_demo
+description: "A project demonstrating a BlinkPay custom tab."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -38,10 +38,11 @@ dependencies:
   http: ^1.2.2
   path_provider: ^2.1.0
   url_launcher: ^6.3.0
-  webview_flutter: ^4.2.2
-  webview_flutter_android: ^4.1.0
-  webview_flutter_wkwebview: ^3.7.3
   flutter_dotenv: ^5.2.1
+  flutter_custom_tabs: ^2.2.1
+  app_links: ^6.4.0
+  intl: ^0.20.2
+  timezone: ^0.10.0
 
 dev_dependencies:
   flutter_test:
@@ -65,6 +66,7 @@ flutter:
   uses-material-design: true
   assets:
     - .env
+    - assets/lolly.webp
 
   # To add assets to your application, add an assets section, like this:
   # assets:

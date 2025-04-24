@@ -1,7 +1,7 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.blinkpay_flutter_mobile_app_demo">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="nz.co.blinkpay_flutter_demo">
     <uses-permission android:name="android.permission.INTERNET"/>
     <application
-        android:label="blinkpay_flutter_mobile_app_demo"
+        android:label="blinkpay_flutter_demo"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
@@ -25,14 +25,13 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-
-            <!-- Deep Link Configuration -->
-            <intent-filter android:autoVerify="true">
-                <action android:name="android.intent.action.VIEW"/>
-                <category android:name="android.intent.category.DEFAULT"/>
-                <category android:name="android.intent.category.BROWSABLE"/>
-                <data android:scheme="https" />
-                <data android:scheme="blinkpay" android:host="test-app" android:pathPrefix="/return"/>
+            <!-- Deep linking -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <!-- Accepts URIs that begin with YOUR_SCHEME://YOUR_HOST -->
+                <data android:scheme="blinkpaydemo" android:host="callback" />
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.
