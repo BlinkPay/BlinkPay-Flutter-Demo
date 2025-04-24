@@ -86,3 +86,11 @@ coverage/
 
 # env file
 .env
+
+# Android C++ build artifacts
+/android/app/.cxx/
+
+# Repomix generated files (assuming these should be ignored)
+.repomix/
+.repomixignore
+repomix-output.txt

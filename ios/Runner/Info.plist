@@ -2,24 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- URL Scheme for Deep Linking -->
-    <key>CFBundleURLTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleURLSchemes</key>
-            <array>
-                <string>blinkpay</string>
-            </array>
-            <key>CFBundleURLName</key>
-            <string>nz.co.blinkpay</string>
-        </dict>
-    </array>
-
-    <key>LSApplicationQueriesSchemes</key>
-    <array>
-      <string>blinkpay</string>
-    </array>
-
     <key>CFBundleDevelopmentRegion</key>
     <string>$(DEVELOPMENT_LANGUAGE)</string>
     <key>CFBundleDisplayName</key>
@@ -63,5 +45,17 @@
     <true/>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
+    <!-- Deep linking URL Types -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>blinkpaydemo</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

@@ -15,7 +15,7 @@ class Environment {
     dotenv.env['BLINKPAY_CLIENT_SECRET'] ?? '';
     
   static String get redirectUri => 
-    dotenv.env['APP_REDIRECT_URI'] ?? 'blinkpay://test-app/return';
+      dotenv.env['APP_REDIRECT_URI'] ?? 'blinkpaydemo://callback';
 
   static String get unitPrice =>
     dotenv.env['UNIT_PRICE'] ?? '1.00';
