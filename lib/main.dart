@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_custom_tabs/flutter_custom_tabs.dart' as custom_tabs;
 import 'package:timezone/data/latest.dart' as tz;
-import 'package:flutter/services.dart';
 
 import './blinkpay_service.dart';
 import './env.dart';
@@ -27,13 +26,69 @@ Future<void> main() async {
   // Validate essential environment variables
   if (!Environment.isValid()) {
     Log.error("CRITICAL ERROR: Environment variables not configured.");
-    Log.error(
-        "Please ensure BLINKPAY_CLIENT_ID and BLINKPAY_CLIENT_SECRET are set in your .env file.");
-    // In a real app, you might want to show an error screen or prevent startup.
-    // For this demo, we'll print to console and continue, but it likely won't work.
+    runApp(const ErrorApp(
+      message: 'Configuration Error',
+      details: 'Please ensure BLINKPAY_CLIENT_ID and BLINKPAY_CLIENT_SECRET are set in your .env file.',
+    ));
+    return;
   }
 
   runApp(const BlinkPayApp());
+}
+
+/// Error application widget for configuration issues
+class ErrorApp extends StatelessWidget {
+  final String message;
+  final String details;
+
+  const ErrorApp({
+    super.key,
+    required this.message,
+    required this.details,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'BlinkPay Demo - Error',
+      home: Scaffold(
+        backgroundColor: const Color(0xFF1a273a),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(
+                  Icons.error_outline,
+                  color: Colors.red,
+                  size: 80,
+                ),
+                const SizedBox(height: 24),
+                Text(
+                  message,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  details,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 16,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// Main application widget defining the theme and home screen
@@ -103,10 +158,12 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     _paymentManager = PaymentManager(
       blinkPayService: _blinkPayService,
       cartModel: _cartModel,
-      launchUrlCallback: _launchUrlInternal,
       showSnackBarCallback: _showSnackBar,
       handleApiErrorCallback: _handleApiError,
     );
+
+    // Listen for payment state changes to handle URL launching
+    _paymentManager.addListener(_onPaymentManagerChanged);
 
     // Initialize DeepLinkHandler with callbacks that use PaymentManager
     _deepLinkHandler = DeepLinkHandler(
@@ -116,7 +173,6 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     
     WidgetsBinding.instance.addObserver(this);
     _cartModel.addListener(_onCartModelChanged);
-    _paymentManager.addListener(_onPaymentManagerChanged);
     Log.info("BlinkPayDemoState initialized.");
   }
 
@@ -298,6 +354,30 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     );
   }
 
+  /// Handle payment button clicks and initiate payment flow
+  Future<void> _handlePaymentButtonClick(String type) async {
+    if (!mounted) return;
+
+    // Get redirect URL from payment manager
+    final redirectUrl = await _paymentManager.handleButtonClick(type);
+
+    // If we got a redirect URL and still mounted, launch it
+    if (redirectUrl != null && mounted) {
+      final consentId = _paymentManager.consentIdForVerification;
+      _paymentManager.markCustomTabOpen();
+
+      try {
+        Log.info('Launching Redirect URL: $redirectUrl for consent $consentId');
+        await _launchUrlInternal(context, redirectUrl);
+      } catch (e, stacktrace) {
+        Log.error('Error launching URL for consent $consentId', e, stacktrace);
+        if (mounted) {
+          _paymentManager.onLaunchError(consentId, e.toString());
+        }
+      }
+    }
+  }
+
   // ====== MAIN UI BUILD ======
   @override
   Widget build(BuildContext context) {
@@ -305,9 +385,7 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     bool buttonsDisabled =
         _paymentManager.isLoading || _paymentManager.isDisabled;
     bool showLoadingOverlay = _paymentManager.isLoading;
-    String? errorMsg = _paymentManager.errorDetails;
-    String? currentConsent = _paymentManager.consentIdForVerification;
-    PaymentState currentState = _paymentManager.state; // Get current state
+    PaymentState currentState = _paymentManager.state;
     
     return Scaffold(
       appBar: AppBar(
@@ -338,7 +416,7 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
 
                   PaymentButtons(
                     isDisabled: buttonsDisabled,
-                    onButtonClick: _paymentManager.handleButtonClick,
+                    onButtonClick: (type) => _handlePaymentButtonClick(type),
                   ),
                 ],
               ),

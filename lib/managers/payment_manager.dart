@@ -23,8 +23,7 @@ class PaymentManager extends ChangeNotifier {
   final ShoppingCartModel _cartModel;
 
   // Callbacks for UI interactions (passed from the screen)
-  final Future<void> Function(BuildContext context, String url)
-      launchUrlCallback;
+  // Note: BuildContext is obtained at call-time to avoid stale context issues
   final Function(bool success, String message) showSnackBarCallback;
   final Function(String message) handleApiErrorCallback;
 
@@ -55,7 +54,6 @@ class PaymentManager extends ChangeNotifier {
   PaymentManager({
     required BlinkPayService blinkPayService,
     required ShoppingCartModel cartModel,
-    required this.launchUrlCallback,
     required this.showSnackBarCallback,
     required this.handleApiErrorCallback,
   })  : _blinkPayService = blinkPayService,
@@ -235,21 +233,12 @@ class PaymentManager extends ChangeNotifier {
               'Payment was not completed successfully or timed out');
         }
 
-        // Step 5: Payment Success - Fetch Final Details and Show Confirmation
-        Log.info('Payment successful! Fetching final details...');
+        // Step 5: Payment Success - Show Confirmation and Reset
+        Log.info('Payment successful!');
         if (!_isCustomTabOpen) {
           showSnackBarCallback(true, 'Payment completed successfully!');
         }
 
-        Map<String, dynamic> finalConsentData;
-        Log.info(
-            '<<< Fetching FINAL ${flowType == 'single' ? 'Single' : 'Enduring'} Consent Data...');
-        if (flowType == 'single') {
-          finalConsentData = await _blinkPayService.getSingleConsent(consentId);
-        } else {
-          finalConsentData =
-              await _blinkPayService.getEnduringConsent(consentId);
-        }
         resetPaymentState(); // Final state reached, reset everything
       } else {
         // Handle cases where consent is not authorised (e.g., Pending, Declined)
@@ -295,53 +284,44 @@ class PaymentManager extends ChangeNotifier {
     }
   }
 
-  /// Launches the BlinkPay redirect URL in a custom tab/browser window.
-  Future<void> _launchUrl(BuildContext context, String url) async {
-    final consentIdLaunched = _consentIdForVerification;
-    if (consentIdLaunched == null || _state != PaymentState.awaitingRedirect) {
-      Log.info(
-          'Launch URL called in invalid state ($_state) or without consent ID.');
-      return;
-    }
-
-    _updateState(_state,
-        consentId: _consentIdForVerification, // Preserve existing ID
-        consentType: _consentTypeForVerification, // Preserve existing Type
-        isCustomTabOpen: true); // Keep state, just flag tab open
-    try {
-      Log.info('Launching Redirect URL: $url for consent $consentIdLaunched');
-      await launchUrlCallback(context, url);
-      // Custom tab closed or launch attempt completed.
-      // We might have received a deep link in the meantime which triggers checkConsentStatus.
-      // If not, the app resuming might trigger it via lifecycle events.
-    } catch (e, stacktrace) {
-      Log.error(
-          'Error launching URL for consent $consentIdLaunched', e, stacktrace);
-      _updateState(PaymentState.error,
-          error: 'Failed to open payment page.',
-          isCustomTabOpen: false,
-          consentId: consentIdLaunched,
-          consentType:
-              _consentTypeForVerification); // Preserve type on error too
-      handleApiErrorCallback(_errorDetails!); // Use callback for UI layer error
+  /// Marks the custom tab as open when URL launch begins
+  void markCustomTabOpen() {
+    if (_state == PaymentState.awaitingRedirect) {
+      _updateState(_state,
+          consentId: _consentIdForVerification,
+          consentType: _consentTypeForVerification,
+          isCustomTabOpen: true);
     }
   }
 
+  /// Handles error when URL launch fails
+  void onLaunchError(String? consentId, String error) {
+    Log.error('Error launching URL for consent $consentId: $error');
+    _updateState(PaymentState.error,
+        error: 'Failed to open payment page.',
+        isCustomTabOpen: false,
+        consentId: consentId,
+        consentType: _consentTypeForVerification);
+    handleApiErrorCallback('Failed to open payment page.');
+  }
+
   /// Handles payment button click: updates state and starts submission.
-  void handleButtonClick(BuildContext context, String type) {
+  /// Returns the redirect URL if successful, null otherwise.
+  Future<String?> handleButtonClick(String type) async {
     if (isLoading || isDisabled) {
       Log.info('Ignoring button click: Already processing (State: $_state)');
-      return;
+      return null;
     }
     Log.info('Button clicked: $type. Current State: $_state');
     // Reset cart before starting a new payment (important for enduring)
     _cartModel.reset();
     _updateState(PaymentState.creatingConsent, consentId: null, error: null);
-    _submitPayment(context, type); // Pass context and type
+    return await _submitPayment(type);
   }
 
   /// Submits the initial request to BlinkPay to create a payment consent.
-  Future<void> _submitPayment(BuildContext context, String buttonType) async {
+  /// Returns the redirect URL if successful, null otherwise.
+  Future<String?> _submitPayment(String buttonType) async {
     // Revoke any existing consent before starting a new one
     if (_consentIdForVerification != null &&
         _consentTypeForVerification != null) {
@@ -368,7 +348,7 @@ class PaymentManager extends ChangeNotifier {
     if (_state != PaymentState.creatingConsent) {
       Log.error(
           'Submit payment called in incorrect state: $_state. Expected creatingConsent.');
-      return; // Should not happen if handleButtonClick is used
+      return null; // Should not happen if handleButtonClick is used
     }
 
     final total = _cartModel.total;
@@ -425,15 +405,14 @@ class PaymentManager extends ChangeNotifier {
         Log.info("Flow interrupted before redirect; aborting submitPayment.");
         // If consent was created but flow cancelled, maybe try to revoke?
         // For simplicity, just log and exit.
-        return;
+        return null;
       }
 
-      // Step 2: Update State and Launch Redirect URL
+      // Step 2: Update State - URL will be launched by caller
       _updateState(PaymentState.awaitingRedirect,
           consentId: consentId, consentType: buttonType); // Store type
-      Log.info('Launching redirect URI...');
-      await _launchUrl(
-          context, redirectUri); // Hand over to the browser/custom tab
+      Log.info('Redirect URI ready for launch');
+      return redirectUri; // Return URL for caller to launch
     } catch (e, stacktrace) {
       // Handle errors during consent creation
       final rawErrorMsg = e.toString();
@@ -449,8 +428,7 @@ class PaymentManager extends ChangeNotifier {
         Log.info(
             'Ignoring initiation error for different/old attempt (State: $_state).');
       }
+      return null;
     }
-    // Don't reset state here on success. State is now awaitingRedirect.
-    // State changes happen after redirect/resume or error.
   }
 }
