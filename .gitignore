@@ -94,3 +94,8 @@ coverage/
 .repomix/
 .repomixignore
 repomix-output.txt
+
+# Claude Code settings and development files
+.claude/settings*.json
+IOS_KEYBOARD_ISSUE.md
+CODE_REVIEW.md
