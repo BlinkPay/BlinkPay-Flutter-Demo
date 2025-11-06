@@ -13,7 +13,8 @@ import SafariServices
   }
 
   override func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
-    if url.scheme == "blinkpaydemo" {
+    // Only dismiss Safari VC if both scheme and host match (consistent with Android)
+    if url.scheme == "blinkpaydemo" && url.host == "callback" {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
         self.dismissSafariViewControllerIfPresent()
       }

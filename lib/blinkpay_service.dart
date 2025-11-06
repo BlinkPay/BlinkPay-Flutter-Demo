@@ -64,11 +64,29 @@ class PaymentCheckException implements Exception {
 class BlinkPayService {
   static const int maxStatusChecks = 10;
   static const Duration checkInterval = Duration(seconds: 1);
+  static const Duration apiTimeout = Duration(seconds: 30);
+  static const Duration retryDelay = Duration(seconds: 1);
+  static const int maxRetries = 3;
 
   // Authentication state
   String? _accessToken;
   DateTime? _tokenExpiry;
-  
+  Future<String>? _tokenRefreshFuture;
+
+  /// Checks if an error is retryable (network errors, 5xx, 429)
+  bool _isRetryableError(dynamic error) {
+    final errorStr = error.toString().toLowerCase();
+    return errorStr.contains('timeout') ||
+           errorStr.contains('socket') ||
+           errorStr.contains('connection') ||
+           errorStr.contains('network') ||
+           errorStr.contains('status code 500') ||
+           errorStr.contains('status code 502') ||
+           errorStr.contains('status code 503') ||
+           errorStr.contains('status code 504') ||
+           errorStr.contains('status code 429');
+  }
+
   /// Get a valid access token, refreshing if necessary
   Future<String> _getToken() async {
     try {
@@ -77,98 +95,143 @@ class BlinkPayService {
         return _accessToken!;
       }
 
-      // Request new token
-      final tokenUri = Uri.https(Environment.blinkPayApiUrl, '/oauth2/token');
-      debugPrint('Getting new BlinkPay access token');
-
-      final response = await http.post(
-        tokenUri,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'client_id': Environment.clientId,
-          'client_secret': Environment.clientSecret,
-          'grant_type': 'client_credentials'
-        }),
-          )
-          .timeout(const Duration(seconds: 10));
-
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        _accessToken = data['access_token'];
-        _tokenExpiry = DateTime.now().add(Duration(seconds: data['expires_in']));
-        return _accessToken!;
+      // Reuse in-flight token refresh to prevent race condition
+      if (_tokenRefreshFuture != null) {
+        debugPrint('Waiting for in-flight token refresh');
+        return await _tokenRefreshFuture!;
       }
 
-      throw Exception('Failed to get token: ${response.statusCode}');
+      // Start new token refresh
+      _tokenRefreshFuture = _refreshToken();
+      try {
+        return await _tokenRefreshFuture!;
+      } finally {
+        _tokenRefreshFuture = null;
+      }
     } catch (e) {
       debugPrint('Error getting token: $e');
       rethrow;
     }
   }
 
-  /// Make an authenticated API request with error handling
+  /// Refreshes the access token
+  Future<String> _refreshToken() async {
+    final tokenUri = Uri.https(Environment.blinkPayApiUrl, '/oauth2/token');
+    debugPrint('Refreshing BlinkPay access token');
+
+    final response = await http.post(
+      tokenUri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'client_id': Environment.clientId,
+        'client_secret': Environment.clientSecret,
+        'grant_type': 'client_credentials'
+      }),
+    ).timeout(const Duration(seconds: 10));
+
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      _accessToken = data['access_token'];
+      _tokenExpiry = DateTime.now().add(Duration(seconds: data['expires_in']));
+      debugPrint('Access token refreshed successfully');
+      return _accessToken!;
+    }
+
+    throw Exception('Failed to get token: ${response.statusCode}');
+  }
+
+  /// Make an authenticated API request with error handling and retry logic
   Future<Map<String, dynamic>> _makeApiRequest({
     required String method,
     required String endpoint,
     Map<String, dynamic>? body,
   }) async {
-    try {
-      final token = await _getToken();
-      final url = 'https://${Environment.blinkPayApiUrl}$endpoint';
+    int attempt = 0;
 
-      http.Response response;
+    while (attempt < maxRetries) {
+      attempt++;
 
-      switch (method.toUpperCase()) {
-        case 'GET':
-          response = await http.get(
-            Uri.parse(url),
-            headers: {'Authorization': 'Bearer $token'},
-          );
-          break;
-        case 'POST':
-          response = await http.post(
-            Uri.parse(url),
-            headers: {
-              'Authorization': 'Bearer $token',
-              'Content-Type': 'application/json',
-            },
-            body: jsonEncode(body),
-          );
-          break;
-        case 'DELETE':
-          response = await http.delete(
-            Uri.parse(url),
-            headers: {'Authorization': 'Bearer $token'},
-          );
-          break;
-        default:
-          throw Exception('Unsupported method: $method');
+      try {
+        final token = await _getToken();
+        final url = 'https://${Environment.blinkPayApiUrl}$endpoint';
+
+        http.Response response;
+
+        switch (method.toUpperCase()) {
+          case 'GET':
+            response = await http.get(
+              Uri.parse(url),
+              headers: {'Authorization': 'Bearer $token'},
+            ).timeout(apiTimeout);
+            break;
+          case 'POST':
+            response = await http.post(
+              Uri.parse(url),
+              headers: {
+                'Authorization': 'Bearer $token',
+                'Content-Type': 'application/json',
+              },
+              body: jsonEncode(body),
+            ).timeout(apiTimeout);
+            break;
+          case 'DELETE':
+            response = await http.delete(
+              Uri.parse(url),
+              headers: {'Authorization': 'Bearer $token'},
+            ).timeout(apiTimeout);
+            break;
+          default:
+            throw Exception('Unsupported method: $method');
+        }
+
+        // Special case for DELETE which returns no content
+        if (method.toUpperCase() == 'DELETE') {
+          if (response.statusCode == 204) {
+            return {'success': true};
+          } else if (response.statusCode == 409) {
+            return {'success': true, 'alreadyRevoked': true};
+          } else if (response.statusCode == 422) {
+            return {'success': false, 'completed': true};
+          }
+          // If DELETE returns other status codes, fall through to the general error handling
+        }
+
+        // Handle successful responses
+        if (response.statusCode == 200 || response.statusCode == 201) {
+          return jsonDecode(response.body);
+        }
+
+        // Handle error responses
+        final errorException = Exception(
+            'API request failed: Status code ${response.statusCode}');
+
+        // Retry on 5xx or 429
+        if ((response.statusCode >= 500 && response.statusCode < 600) ||
+            response.statusCode == 429) {
+          if (attempt < maxRetries) {
+            debugPrint('Retryable error (${response.statusCode}), attempt $attempt/$maxRetries');
+            await Future.delayed(retryDelay);
+            continue;
+          }
+        }
+
+        throw errorException;
+      } catch (e) {
+        debugPrint('API error ($method $endpoint), attempt $attempt/$maxRetries: $e');
+
+        // Retry on network errors
+        if (_isRetryableError(e) && attempt < maxRetries) {
+          debugPrint('Retrying after network error...');
+          await Future.delayed(retryDelay);
+          continue;
+        }
+
+        // No more retries or non-retryable error
+        rethrow;
       }
-      
-      // Special case for DELETE which returns no content
-      if (method.toUpperCase() == 'DELETE') {
-        if (response.statusCode == 204) {
-          return {'success': true};
-        } else if (response.statusCode == 409) {
-          return {'success': true, 'alreadyRevoked': true};
-        } else if (response.statusCode == 422) {
-          return {'success': false, 'completed': true};
-        } 
-        // If DELETE returns other status codes, fall through to the general error handling
-      }
-      
-      // Handle successful responses
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        return jsonDecode(response.body);
-      }
-      
-      // Handle error responses
-      throw Exception(
-          'API request failed: ${response.statusCode} - ${response.body}');
-    } catch (e) {
-      debugPrint('API error ($method $endpoint): $e');
-      rethrow;
     }
+
+    throw Exception('API request failed after $maxRetries attempts');
   }
 
   /// Create a single payment consent
@@ -403,8 +466,18 @@ class BlinkPayService {
 
         } catch (e) {
           debugPrint('Error in status check attempt $attempts: $e');
-          // Consider if specific errors should allow retries vs immediate failure
-          return false; // Fail on error during polling attempt
+
+          // Retry on transient errors
+          if (_isRetryableError(e)) {
+            if (attempts < maxStatusChecks) {
+              debugPrint('Retryable error during payment verification, continuing...');
+              await Future.delayed(checkInterval);
+              continue;
+            }
+          }
+
+          // Non-retryable error or retries exhausted
+          return false;
         }
       } // End of while loop
 
