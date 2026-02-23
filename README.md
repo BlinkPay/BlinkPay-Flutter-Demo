@@ -1,94 +1,165 @@
 # BlinkPay Flutter Mobile App Demo
 
-A Flutter project showcasing how to integrate e-commerce functionality with the BlinkPay payment gateway. This project demonstrates a mobile implementation of BlinkPay's payment system using `flutter_custom_tabs` and deep linking for seamless payment flow.
+A demo showing how to accept payments with [BlinkPay](https://www.blinkpay.co.nz) from a Flutter mobile app. The project contains two parts:
+
+| Project | Directory | Purpose |
+|---|---|---|
+| **Flutter App** | Root (`lib/`) | Shopping cart UI that initiates payments and handles bank redirects |
+| **Proxy Server** | `server/` | Dart Shelf backend that holds BlinkPay API credentials and forwards requests |
+
+The app never sees BlinkPay secrets — all API calls go through the proxy server, which manages OAuth2 tokens and authenticates with BlinkPay on the app's behalf.
 
 ## Features
 
-*   Add/remove items from a shopping cart.
-*   Initiate Single Payments via BlinkPay Gateway flow.
-*   Initiate Enduring Consents via BlinkPay Gateway flow.
-*   Handle payment redirects using deep linking (`flutter_custom_tabs` and `uni_links`).
-*   Display payment status updates.
-*   Basic error handling.
-*   Automatic dismissal of `SFSafariViewController` on iOS upon deep link reception (See Native iOS Modifications).
+- Shopping cart with quantity controls
+- Single payments (PayNow) via BlinkPay Gateway flow
+- Enduring consents (AutoPay) via BlinkPay Gateway flow
+- Bank redirect handling via deep links (`flutter_custom_tabs` + `app_links`)
+- Payment status polling and display
+- Backend proxy that keeps `client_id` / `client_secret` server-side
 
 ## Prerequisites
 
-Ensure you have the following installed:
+- Flutter SDK (latest stable)
+- Dart SDK (included with Flutter)
+- A BlinkPay Sandbox account — [Merchant Portal](https://merchants.blinkpay.co.nz/settings/api)
+- Android Studio or VS Code with Flutter extensions
+- Xcode (for iOS, macOS only) — minimum iOS 13.0
 
-*   Flutter SDK (latest stable version)
-*   Android Studio or VS Code with Flutter extensions
-*   Xcode (for iOS development, macOS only)
-*   Git
-*   A BlinkPay Sandbox Account (for testing payments)
-*   **Minimum iOS Version:** This project requires a minimum iOS deployment target of 13.0 due to native code used for automatically dismissing the Safari view controller. This should be configured automatically by the included Xcode project settings.
+## Quick Start
 
-## Getting Started
-
-### Installation
-
-1.  **Clone the Repository:**
-    ```bash
-    git clone <repository-url>
-    cd blinkpay_flutter_mobile_app_demo
-    ```
-
-2.  **Install Dependencies:**
-    ```bash
-    flutter pub get
-    ```
-    If developing for iOS, also run:
-    ```bash
-    cd ios
-    pod install
-    cd ..
-    ```
-
-### Configuration
-
-#### BlinkPay Configuration
-
-1.  Log into the [BlinkPay Merchant Portal](https://merchants.blinkpay.co.nz/settings/api) (Sandbox environment).
-2.  Navigate to your app under Settings/API.
-3.  Add your Redirect URI `blinkpaydemo://callback` to your whitelist redirect URLs and save.
-4.  Copy the Client ID (API key).
-5.  Generate a new secret using "Rotate Secret" and copy it immediately.
-
-#### Environment Configuration
-
-Create a `.env` file in the root of the project with your BlinkPay Sandbox credentials:
-
-```
-BLINKPAY_CLIENT_ID=<your_blinkpay_client_id>
-BLINKPAY_CLIENT_SECRET=<your_blinkpay_secret>
-# Optional: Specify the BlinkPay API hostname if not using production
-# BLINKPAY_HOSTNAME=sandbox.blinkpay.co.nz 
+```bash
+git clone <repository-url>
+cd blinkpay_flutter_mobile_app_demo
+flutter pub get
+cp server/.env.example server/.env
+# Edit server/.env with your BlinkPay sandbox credentials (see below)
+./run.sh
 ```
 
-### Deep Linking Setup
+The script installs server dependencies, prompts for your target device, starts the proxy server, and launches the Flutter app. You can skip the prompt with `./run.sh --simulator`, `--emulator`, or `--lan`.
 
-For the payment redirect flow to return the user to the app correctly, you need to configure platform-specific deep linking. This demo uses the custom URL scheme `blinkpaydemo://callback`.
+### BlinkPay credentials
 
-#### Android (`android/app/src/main/AndroidManifest.xml`)
+Edit `server/.env` with your sandbox credentials:
 
-Ensure the following `<intent-filter>` exists inside the `<activity>` tag for `.MainActivity`:
+```
+BLINKPAY_API_URL=sandbox.debit.blinkpay.co.nz
+BLINKPAY_CLIENT_ID=your_client_id_here
+BLINKPAY_CLIENT_SECRET=your_client_secret_here
+APP_API_KEY=                              # Leave empty — run.sh will auto-generate one
+SERVER_PORT=4567
+```
+
+To get these: log into the [BlinkPay Merchant Portal](https://merchants.blinkpay.co.nz/settings/api), go to Settings > API, add `blinkpaydemo://callback` to your redirect URIs, copy the Client ID, and rotate/copy the secret.
+
+<details>
+<summary>Manual setup (without run.sh)</summary>
+
+**Terminal 1 — Start the server:**
+
+```bash
+cd server && dart pub get && dart run bin/server.dart
+```
+
+**Terminal 2 — Start the Flutter app:**
+
+```bash
+flutter run \
+  --dart-define=BACKEND_URL=http://10.0.2.2:4567 \
+  --dart-define=APP_API_KEY=your_api_key_from_server_env
+```
+
+Use the appropriate `BACKEND_URL` for your device:
+
+| Device | `BACKEND_URL` |
+|---|---|
+| Android Emulator | `http://10.0.2.2:4567` |
+| iOS Simulator | `http://localhost:4567` |
+| Physical device (USB or same network) | `http://<your-lan-ip>:4567` |
+
+To find your LAN IP: `ipconfig getifaddr en0` (macOS) or `hostname -I` (Linux).
+
+</details>
+
+## Payment Flow
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Proxy as Proxy Server
+    participant BP as BlinkPay API
+    participant Bank as Bank / Gateway
+
+    App->>Proxy: 1. Create consent (+ API key)
+    Proxy->>BP: 2. Forward request (+ OAuth2 token)
+    BP-->>Proxy: 3. {consent_id, redirect_uri}
+    Proxy-->>App: 4. {consent_id, redirect_uri}
+    App->>Bank: 5. Open redirect_uri (Custom Tab)
+    Note over Bank: User authorises payment
+    Bank-->>App: 6. Deep link: blinkpaydemo://callback?cid=xxx
+    App->>Proxy: 7. Check consent status
+    Proxy->>BP: 8. Get consent
+    BP-->>Proxy: 9. {status: Authorised}
+    Proxy-->>App: 10. {status: Authorised}
+    App->>Proxy: 11. Create payment
+    Proxy->>BP: 12. Forward payment
+    BP-->>Proxy: 13. {payment_id}
+    Proxy-->>App: 14. {payment_id}
+    App->>App: 15. Poll until payment completes
+```
+
+Deep links (`blinkpaydemo://callback`) go directly from the bank back to the app — they don't pass through the proxy.
+
+## Security Notes
+
+> **This is a demo using BlinkPay's sandbox environment.** It demonstrates the correct architecture for mobile-to-BlinkPay integration. App-to-server auth is simplified for demo purposes.
+
+**What the demo gets right:**
+- BlinkPay `client_id` and `client_secret` are held server-side only
+- The app binary contains zero BlinkPay secrets
+- API calls are proxied through the backend
+- App-to-server auth is demonstrated via a shared API key
+
+**What production apps should add:**
+- Proper app-to-server authentication (OAuth2, JWT, session tokens)
+- HTTPS/TLS between app and backend (this demo uses HTTP)
+- Rate limiting, request validation, and input sanitisation on the server
+- Hosted backend deployment (not localhost)
+- Secrets manager for server-side credentials
+
+## Deep Linking Setup
+
+After the user authorises a payment at their bank, BlinkPay redirects back to the app via a custom URL scheme (`blinkpaydemo://callback` in this demo). This requires platform-specific configuration that you'll need to replicate in your own project.
+
+### Flutter dependencies
+
+Add these to your `pubspec.yaml`:
+
+```yaml
+dependencies:
+  flutter_custom_tabs: ^2.5.0   # Opens bank redirect in Chrome Custom Tab / SFSafariViewController
+  app_links: ^7.0.0             # Listens for incoming deep links
+```
+
+### Android — `android/app/src/main/AndroidManifest.xml`
+
+Add an intent filter inside your `<activity>` tag so Android routes your scheme to the app:
 
 ```xml
-<activity ... >
-    <!-- ... other intent filters ... -->
-
-    <!-- Add/Verify this filter -->
+<activity android:name=".MainActivity" android:launchMode="singleTop" ... >
+    <!-- Deep linking -->
     <intent-filter>
         <action android:name="android.intent.action.VIEW" />
         <category android:name="android.intent.category.DEFAULT" />
         <category android:name="android.intent.category.BROWSABLE" />
-        <!-- Accepts URIs that begin with blinkpaydemo:// -->
-        <data android:scheme="blinkpaydemo" />
+        <data android:scheme="your_scheme" android:host="callback" />
     </intent-filter>
 </activity>
 ```
 
-Also ensure the following are present under the `<manifest>` tag:
+Also add under `<manifest>` to allow opening HTTPS URLs in Custom Tabs:
+
 ```xml
 <uses-permission android:name="android.permission.INTERNET"/>
 
@@ -101,9 +172,11 @@ Also ensure the following are present under the `<manifest>` tag:
 </queries>
 ```
 
-#### iOS (`ios/Runner/Info.plist`)
+> **Note:** `android:launchMode="singleTop"` is important — without it, the deep link may open a second instance of your activity instead of returning to the existing one.
 
-Ensure the `CFBundleURLTypes` key exists in your `Info.plist` file:
+### iOS — `ios/Runner/Info.plist`
+
+Register your URL scheme so iOS routes it to the app:
 
 ```xml
 <key>CFBundleURLTypes</key>
@@ -113,76 +186,91 @@ Ensure the `CFBundleURLTypes` key exists in your `Info.plist` file:
         <string>Editor</string>
         <key>CFBundleURLSchemes</key>
         <array>
-            <!-- Your chosen URL scheme -->
-            <string>blinkpaydemo</string>
+            <string>your_scheme</string>
         </array>
     </dict>
 </array>
 ```
 
-## Payment Flow
+### iOS — `ios/Runner/AppDelegate.swift` (auto-dismiss Safari)
 
-This diagram illustrates the typical sequence of events when making a payment using the BlinkPay gateway integration in this demo app:
+When the bank redirects back, `SFSafariViewController` stays on screen unless explicitly dismissed. Without this, users have to manually tap "Done". Add this to your `AppDelegate`:
 
-```mermaid
-sequenceDiagram
-    participant App
-    participant BlinkPay API
-    participant Bank / BlinkPay Gateway
-    
-    App->>BlinkPay API: 1. Create Consent (Single/Enduring)
-    BlinkPay API-->>App: 2. Return Consent ID & Gateway Redirect URI
-    App->>Bank / BlinkPay Gateway: 3. Open Redirect URI (Custom Tab / SFSafariVC)
-    Note over Bank / BlinkPay Gateway: User Authorizes / Cancels
-    Bank / BlinkPay Gateway-->>App: 4. Redirect back via Deep Link (blinkpaydemo://...)
-    App->>BlinkPay API: 5. Check Consent Status (using Consent ID)
-    BlinkPay API-->>App: 6. Respond with Status (e.g., Authorised)
-    alt Consent Authorised
-        App->>BlinkPay API: 7. Create Payment (using Consent ID)
-        BlinkPay API-->>App: 8. Acknowledge Payment (Payment ID)
-        App->>BlinkPay API: 9. Poll for Payment Status (using Payment ID/Consent ID)
-        BlinkPay API-->>App: 10. Return final Payment Status (e.g., AcceptedSettlementCompleted)
-        App->>App: 11. Show Success Message
-    else Consent Not Authorised or Error
-        App->>App: Show Error Message
-    end
+```swift
+import SafariServices
+
+override func application(_ app: UIApplication, open url: URL,
+                          options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
+    if url.scheme == "your_scheme" && url.host == "callback" {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.dismissSafariViewControllerIfPresent()
+        }
+    }
+    return super.application(app, open: url, options: options)
+}
+
+func dismissSafariViewControllerIfPresent() {
+    guard let windowScene = UIApplication.shared.connectedScenes
+              .compactMap({ $0 as? UIWindowScene })
+              .first(where: { $0.activationState == .foregroundActive }),
+          let rootVC = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController else { return }
+
+    var topVC = rootVC
+    while let presented = topVC.presentedViewController { topVC = presented }
+
+    if let safariVC = topVC as? SFSafariViewController {
+        safariVC.dismiss(animated: true)
+    }
+}
 ```
 
-## Native iOS Modifications
+> **Note:** The 0.1s delay ensures the app is fully foregrounded before attempting to dismiss. Requires iOS 13.0+ deployment target (for `connectedScenes`).
 
-### SFSafariViewController Auto-Dismissal
+### BlinkPay redirect URI
 
-To improve the user experience on iOS and make it more consistent with Android's Chrome Custom Tabs behaviour, native Swift code has been added to automatically dismiss the `SFSafariViewController` when the BlinkPay redirect (using the `blinkpaydemo://` custom URL scheme) is received by the application.
+Whatever scheme you choose, register it as a redirect URI in the [BlinkPay Merchant Portal](https://merchants.blinkpay.co.nz/settings/api) under Settings > API. The URI must match exactly (e.g. `your_scheme://callback`).
 
-*   **Purpose:** Prevents the user from needing to manually tap "Done" or "Cancel" on the Safari view after completing or cancelling the payment flow.
-*   **Location:** The relevant code resides in `ios/Runner/AppDelegate.swift`. It overrides the `application(_:open:options:)` method to intercept the URL and includes a helper function `dismissSafariViewControllerIfPresent` to find and dismiss the view controller.
-*   **Compatibility:** The code uses `#available` checks to ensure compatibility with the project's iOS 12 deployment target.
+## Project Structure
 
-This modification allows the Flutter application to handle the deep link payload while the native layer takes care of closing the web view seamlessly.
-
-## Running the Application
-
-Ensure you have an emulator running or a device connected.
-
-Run the app in debug mode:
-
-```bash
-flutter run
 ```
-
-## Libraries Used
-
-*   `flutter_custom_tabs`: For launching the web URLs in a platform-idiomatic way (Chrome Custom Tabs on Android, SFSafariViewController on iOS).
-*   `uni_links`: For handling incoming deep links (custom URL schemes).
-*   `flutter_dotenv`: For managing environment variables from a `.env` file.
-*   `http`: For making HTTP requests to the BlinkPay API.
-*   `timezone`: For date/time handling (required by BlinkPay API).
-*   `ChangeNotifier`: Used within `PaymentManager` for state management, notifying listeners to trigger UI updates via `setState`.
-
-## Contributing
-
-Contributions are welcome. Please follow standard fork and pull request workflows.
+.
+├── lib/                              # Flutter app
+│   ├── main.dart                     # Entry point and main UI
+│   ├── blinkpay_service.dart         # HTTP client (calls proxy, NOT BlinkPay)
+│   ├── env.dart                      # Config from --dart-define (no secrets)
+│   ├── constants.dart                # App constants
+│   ├── handlers/
+│   │   └── deep_link_handler.dart    # Deep link listener
+│   ├── managers/
+│   │   └── payment_manager.dart      # Payment flow state machine
+│   ├── models/
+│   │   └── shopping_cart_model.dart  # Cart state
+│   ├── utils/
+│   │   ├── log.dart                  # Logging utility
+│   │   └── payment_error_helper.dart # Error formatting
+│   └── widgets/
+│       ├── loading_overlay.dart      # Loading spinner overlay
+│       ├── payment_buttons.dart      # PayNow / AutoPay buttons
+│       ├── product_card.dart         # Product display with cart controls
+│       └── status_indicator.dart     # Payment status icon
+├── server/                           # Dart Shelf proxy server
+│   ├── bin/server.dart               # Server entry point
+│   ├── lib/src/
+│   │   ├── config.dart               # Server config from .env
+│   │   ├── blinkpay_client.dart      # BlinkPay API client (OAuth2 tokens)
+│   │   ├── middleware/
+│   │   │   └── auth_middleware.dart   # API key validation
+│   │   └── routes/
+│   │       ├── consent_routes.dart   # Consent proxy endpoints
+│   │       └── payment_routes.dart   # Payment proxy endpoints
+│   ├── .env                          # Server secrets (git-ignored)
+│   ├── .env.example                  # Template
+│   └── pubspec.yaml                  # Server dependencies
+├── run.sh                            # Start server + app together
+├── pubspec.yaml                      # Flutter app dependencies
+└── README.md
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License — see the LICENSE file for details.
