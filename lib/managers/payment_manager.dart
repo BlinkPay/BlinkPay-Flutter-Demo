@@ -8,6 +8,9 @@ import '../constants.dart';
 import '../utils/log.dart';
 import '../utils/payment_error_helper.dart';
 
+/// Sentinel value meaning "don't change this field" in [PaymentManager._updateState].
+const String _unchanged = '\x00_UNCHANGED';
+
 /// Represents the different stages of the payment process.
 enum PaymentState {
   idle, // Initial state, ready for interaction
@@ -62,34 +65,41 @@ class PaymentManager extends ChangeNotifier {
   // ====== PAYMENT LOGIC METHODS ======
 
   /// Updates the state and notifies listeners.
+  ///
+  /// Pass [_unchanged] (the default) to preserve the current value of a field.
+  /// Pass `null` to explicitly clear a field.
   void _updateState(PaymentState newState,
-      {String? consentId,
-      String? consentType,
-      String? error,
+      {String? consentId = _unchanged,
+      String? consentType = _unchanged,
+      String? error = _unchanged,
       bool? isCustomTabOpen}) {
     bool changed = false;
+
     if (_state != newState) {
       _state = newState;
       changed = true;
       Log.info('Payment State changed to: $newState');
     }
-    if (consentId != _consentIdForVerification) {
+
+    // Update consent ID (skip if sentinel)
+    if (consentId != _unchanged && consentId != _consentIdForVerification) {
       _consentIdForVerification = consentId;
-      // Reset type if ID is reset
-      if (consentId == null) {
-        _consentTypeForVerification = null;
-      }
       changed = true;
     }
-    // Update type only if ID is not null
-    if (consentId != null && consentType != _consentTypeForVerification) {
+
+    // Update consent type (skip if sentinel)
+    if (consentType != _unchanged &&
+        consentType != _consentTypeForVerification) {
       _consentTypeForVerification = consentType;
       changed = true;
     }
-    if (error != _errorDetails) {
+
+    // Update error (skip if sentinel)
+    if (error != _unchanged && error != _errorDetails) {
       _errorDetails = error;
       changed = true;
     }
+
     if (isCustomTabOpen != null && _isCustomTabOpen != isCustomTabOpen) {
       _isCustomTabOpen = isCustomTabOpen;
       changed = true;
@@ -147,9 +157,6 @@ class PaymentManager extends ChangeNotifier {
 
     Log.info('Checking consent status for ID: $consentId, type: $flowType');
     _updateState(PaymentState.verifying, consentId: consentId);
-    if (!_isCustomTabOpen) {
-      showSnackBarCallback(true, 'Verifying payment status...');
-    }
 
     try {
       // Step 1: Get Consent Details from BlinkPay
@@ -313,36 +320,32 @@ class PaymentManager extends ChangeNotifier {
       return null;
     }
     Log.info('Button clicked: $type. Current State: $_state');
-    // Reset cart before starting a new payment (important for enduring)
-    _cartModel.reset();
-    _updateState(PaymentState.creatingConsent, consentId: null, error: null);
-    return await _submitPayment(type);
+
+    // Capture old consent details before clearing state, so _submitPayment
+    // can revoke the previous consent if one exists.
+    final oldConsentId = _consentIdForVerification;
+    final oldConsentType = _consentTypeForVerification;
+
+    _updateState(PaymentState.creatingConsent,
+        consentId: null, consentType: null, error: null);
+    return await _submitPayment(type, oldConsentId, oldConsentType);
   }
 
   /// Submits the initial request to BlinkPay to create a payment consent.
   /// Returns the redirect URL if successful, null otherwise.
-  Future<String?> _submitPayment(String buttonType) async {
+  Future<String?> _submitPayment(
+      String buttonType, String? oldConsentId, String? oldConsentType) async {
     // Revoke any existing consent before starting a new one
-    if (_consentIdForVerification != null &&
-        _consentTypeForVerification != null) {
+    if (oldConsentId != null && oldConsentType != null) {
       Log.info(
-          'Revoking previous consent ($_consentIdForVerification - $_consentTypeForVerification) before starting new one.');
+          'Revoking previous consent ($oldConsentId - $oldConsentType) before starting new one.');
       bool revoked;
-      if (_consentTypeForVerification == 'single') {
-        revoked = await _blinkPayService
-            .revokeSingleConsent(_consentIdForVerification!);
+      if (oldConsentType == 'single') {
+        revoked = await _blinkPayService.revokeSingleConsent(oldConsentId);
       } else {
-        revoked = await _blinkPayService
-            .revokeEnduringConsent(_consentIdForVerification!);
+        revoked = await _blinkPayService.revokeEnduringConsent(oldConsentId);
       }
-      Log.info('Previous consent revocation status: $revoked'); // Log outcome
-      // We proceed with the new consent regardless of revocation success/failure.
-      // Errors during revocation (e.g., consent already completed/revoked) are logged by the service but don't stop the new payment flow.
-      // Clear the old state immediately even if revocation fails, to proceed with the new one
-      _updateState(PaymentState.idle, consentId: null, consentType: null);
-    } else {
-      // Ensure we are in the creatingConsent state if no revocation needed
-      _updateState(PaymentState.creatingConsent, consentId: null, error: null);
+      Log.info('Previous consent revocation status: $revoked');
     }
 
     if (_state != PaymentState.creatingConsent) {

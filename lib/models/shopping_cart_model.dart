@@ -57,9 +57,10 @@ class ShoppingCartModel extends ChangeNotifier {
         notifyListeners();
       }
     } else {
-      // Handle invalid input - maybe revert or show error? For now, just ignore.
-      // Or reset to the last valid quantity:
-      // _quantityController.text = _quantity.toString();
+      // Revert text field to last valid quantity to keep UI and state in sync
+      _quantityController.text = _quantity.toString();
+      _quantityController.selection = TextSelection.fromPosition(
+          TextPosition(offset: _quantityController.text.length));
     }
   }
 

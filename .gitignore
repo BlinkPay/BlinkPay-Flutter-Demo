@@ -84,8 +84,9 @@ app.*.map.json
 coverage/
 *.lcov
 
-# env file
+# env files (contain secrets)
 .env
+server/.env
 
 # Android C++ build artifacts
 /android/app/.cxx/

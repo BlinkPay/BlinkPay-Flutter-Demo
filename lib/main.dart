@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_custom_tabs/flutter_custom_tabs.dart' as custom_tabs;
 import 'package:timezone/data/latest.dart' as tz;
 
@@ -14,21 +13,22 @@ import './utils/log.dart';
 import './widgets/product_card.dart';
 import './widgets/payment_buttons.dart';
 import './widgets/loading_overlay.dart';
-import './widgets/status_indicator.dart';
 
-/// Initialize the app: set up timezones and load environment variables
+/// Initialize the app: set up timezones and validate configuration
 Future<void> main() async {
   // Initialise the timezone database.
   tz.initializeTimeZones();
 
-  await dotenv.load(fileName: ".env");
-
-  // Validate essential environment variables
+  // Validate that required --dart-define values are present
   if (!Environment.isValid()) {
-    Log.error("CRITICAL ERROR: Environment variables not configured.");
+    Log.error("CRITICAL ERROR: Backend configuration not set.");
     runApp(const ErrorApp(
       message: 'Configuration Error',
-      details: 'Please ensure BLINKPAY_CLIENT_ID and BLINKPAY_CLIENT_SECRET are set in your .env file.',
+      details: 'Please provide BACKEND_URL and APP_API_KEY via --dart-define.\n\n'
+          'Example:\n'
+          'flutter run --dart-define=BACKEND_URL=http://10.0.2.2:4567 '
+          '--dart-define=APP_API_KEY=your_key\n\n'
+          'Or use the run.sh script which sets these automatically.',
     ));
     return;
   }
@@ -176,13 +176,17 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     Log.info("BlinkPayDemoState initialized.");
   }
 
+  bool _imagePrecached = false;
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // Precache image via cart model
-    precacheImage(const AssetImage('assets/lolly.webp'), context).then((_) {
-      _cartModel.setImageLoaded(true);
-    });
+    if (!_imagePrecached) {
+      _imagePrecached = true;
+      precacheImage(const AssetImage('assets/lolly.webp'), context).then((_) {
+        if (mounted) _cartModel.setImageLoaded(true);
+      });
+    }
   }
 
   @override
@@ -213,8 +217,7 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final consentId = _paymentManager.consentIdForVerification;
     final consentType = _paymentManager.consentTypeForVerification;
-    final isDisabled = _paymentManager.isDisabled;
-    final currentState = _paymentManager.state; // Get current state
+    final currentState = _paymentManager.state;
     Log.info("App lifecycle state changed: $state");
 
     if (state == AppLifecycleState.resumed) {
@@ -237,8 +240,14 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
         // DO NOTHING in the else block - avoid resetting state prematurely.
       }
     } else if (state == AppLifecycleState.paused) {
-      if (consentId != null && isDisabled && !_paymentManager.isCustomTabOpen) {
-        Log.info("Pausing app unexpectedly during active flow, resetting.");
+      // Only reset if we're awaiting redirect and the custom tab isn't open.
+      // Don't reset during creatingConsent or verifying — those are transient
+      // states where a brief pause (notification drawer, permission dialog)
+      // should not abort the flow.
+      if (currentState == PaymentState.awaitingRedirect &&
+          consentId != null &&
+          !_paymentManager.isCustomTabOpen) {
+        Log.info("Pausing app unexpectedly during awaitingRedirect, resetting.");
         _showSnackBar(false, 'Payment process interrupted');
         _paymentManager.resetPaymentState();
       } else if (_paymentManager.isCustomTabOpen) {
@@ -279,9 +288,10 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
           false, 'Payment failed: Invalid redirect received from bank.');
       _paymentManager.resetPaymentState();
     } else {
+      // Stale or mismatched deep link — ignore it rather than disrupting
+      // an active payment flow.
       Log.info(
-          'Redirect received, but no active consent/type or ID mismatch. Resetting via manager. URI Consent: $consentIdFromUri, Current: $currentConsent ($currentConsentType)');
-      _paymentManager.resetPaymentState();
+          'Ignoring deep link: no active consent or ID mismatch. URI Consent: $consentIdFromUri, Current: $currentConsent ($currentConsentType)');
     }
   }
   
@@ -385,16 +395,10 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     bool buttonsDisabled =
         _paymentManager.isLoading || _paymentManager.isDisabled;
     bool showLoadingOverlay = _paymentManager.isLoading;
-    PaymentState currentState = _paymentManager.state;
-    
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('BlinkPay Demo'),
-        actions: [
-          Center(
-            child: StatusIndicator(state: currentState),
-          ),
-        ],
       ),
       body: Stack(
         children: [
@@ -424,7 +428,7 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
           ),
           LoadingOverlay(
             isLoading: showLoadingOverlay,
-            message: currentState == PaymentState.verifying
+            message: _paymentManager.state == PaymentState.verifying
                 ? 'Checking payment status...'
                 : 'Processing...',
           ),

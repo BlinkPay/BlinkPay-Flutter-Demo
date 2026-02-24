@@ -60,18 +60,17 @@ class PaymentCheckException implements Exception {
   String toString() => message;
 }
 
-/// Service for interacting with the BlinkPay API
+/// Service for interacting with BlinkPay via the backend proxy server.
+///
+/// All requests go to the proxy server at [Environment.backendUrl], which
+/// holds the BlinkPay client credentials and forwards requests with the
+/// appropriate OAuth2 token. This app never sees BlinkPay secrets.
 class BlinkPayService {
   static const int maxStatusChecks = 10;
   static const Duration checkInterval = Duration(seconds: 1);
   static const Duration apiTimeout = Duration(seconds: 30);
   static const Duration retryDelay = Duration(seconds: 1);
   static const int maxRetries = 3;
-
-  // Authentication state
-  String? _accessToken;
-  DateTime? _tokenExpiry;
-  Future<String>? _tokenRefreshFuture;
 
   /// Checks if an error is retryable (network errors, 5xx, 429)
   bool _isRetryableError(dynamic error) {
@@ -87,60 +86,10 @@ class BlinkPayService {
            errorStr.contains('status code 429');
   }
 
-  /// Get a valid access token, refreshing if necessary
-  Future<String> _getToken() async {
-    try {
-      // Use existing token if valid
-      if (_accessToken != null && _tokenExpiry != null && DateTime.now().isBefore(_tokenExpiry!)) {
-        return _accessToken!;
-      }
-
-      // Reuse in-flight token refresh to prevent race condition
-      if (_tokenRefreshFuture != null) {
-        debugPrint('Waiting for in-flight token refresh');
-        return await _tokenRefreshFuture!;
-      }
-
-      // Start new token refresh
-      _tokenRefreshFuture = _refreshToken();
-      try {
-        return await _tokenRefreshFuture!;
-      } finally {
-        _tokenRefreshFuture = null;
-      }
-    } catch (e) {
-      debugPrint('Error getting token: $e');
-      rethrow;
-    }
-  }
-
-  /// Refreshes the access token
-  Future<String> _refreshToken() async {
-    final tokenUri = Uri.https(Environment.blinkPayApiUrl, '/oauth2/token');
-    debugPrint('Refreshing BlinkPay access token');
-
-    final response = await http.post(
-      tokenUri,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'client_id': Environment.clientId,
-        'client_secret': Environment.clientSecret,
-        'grant_type': 'client_credentials'
-      }),
-    ).timeout(const Duration(seconds: 10));
-
-    if (response.statusCode == 200) {
-      final data = jsonDecode(response.body);
-      _accessToken = data['access_token'];
-      _tokenExpiry = DateTime.now().add(Duration(seconds: data['expires_in']));
-      debugPrint('Access token refreshed successfully');
-      return _accessToken!;
-    }
-
-    throw Exception('Failed to get token: ${response.statusCode}');
-  }
-
-  /// Make an authenticated API request with error handling and retry logic
+  /// Make an authenticated API request to the backend proxy server.
+  ///
+  /// The proxy server handles BlinkPay OAuth2 authentication. This method
+  /// only needs to include the app-to-server API key.
   Future<Map<String, dynamic>> _makeApiRequest({
     required String method,
     required String endpoint,
@@ -152,32 +101,36 @@ class BlinkPayService {
       attempt++;
 
       try {
-        final token = await _getToken();
-        final url = 'https://${Environment.blinkPayApiUrl}$endpoint';
+        final url = '${Environment.backendUrl}/api$endpoint';
 
         http.Response response;
+
+        // Authenticate with the backend proxy using the static API key.
+        // The proxy then authenticates with BlinkPay using OAuth2 — the
+        // mobile app never sees the BlinkPay client_id or client_secret.
+        final headers = <String, String>{
+          'Authorization': 'Bearer ${Environment.appApiKey}',
+          'Content-Type': 'application/json',
+        };
 
         switch (method.toUpperCase()) {
           case 'GET':
             response = await http.get(
               Uri.parse(url),
-              headers: {'Authorization': 'Bearer $token'},
+              headers: headers,
             ).timeout(apiTimeout);
             break;
           case 'POST':
             response = await http.post(
               Uri.parse(url),
-              headers: {
-                'Authorization': 'Bearer $token',
-                'Content-Type': 'application/json',
-              },
+              headers: headers,
               body: jsonEncode(body),
             ).timeout(apiTimeout);
             break;
           case 'DELETE':
             response = await http.delete(
               Uri.parse(url),
-              headers: {'Authorization': 'Bearer $token'},
+              headers: headers,
             ).timeout(apiTimeout);
             break;
           default:
