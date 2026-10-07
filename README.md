@@ -1,68 +1,54 @@
 # BlinkPay Flutter Mobile App Demo
 
-A demo showing how to accept payments with [BlinkPay](https://www.blinkpay.co.nz) from a Flutter mobile app. The project contains two parts:
+A reference implementation of [Blink Payments](https://www.blinkpay.co.nz) in a mobile app. It is written in Flutter, but the patterns are the same for React Native, Swift, Kotlin or any other mobile framework: a backend that holds the credentials and owns the order, the Blink Payments **gateway flow** opened in the system's in-app browser, a custom-scheme return to the app, and outcome handling that waits for the bank instead of guessing.
 
 | Project | Directory | Purpose |
 |---|---|---|
-| **Flutter App** | Root (`lib/`) | Shopping cart UI that initiates payments and handles bank redirects |
-| **Proxy Server** | `server/` | Dart Shelf backend that holds BlinkPay API credentials and forwards requests |
+| **Flutter app** | Root (`lib/`) | Shopping cart UI: starts a payment, opens the gateway, tracks the outcome |
+| **Backend** | `server/` | Dart Shelf server: holds the Blink Payments credentials, prices the order, creates consents and payments |
 
-The app never sees BlinkPay secrets — all API calls go through the proxy server, which manages OAuth2 tokens and authenticates with BlinkPay on the app's behalf.
-
-## Features
-
-- Shopping cart with quantity controls
-- Single payments (PayNow) via BlinkPay Gateway flow
-- Enduring consents (AutoPay) via BlinkPay Gateway flow
-- Bank redirect handling via deep links (`flutter_custom_tabs` + `app_links`)
-- Payment status polling and display
-- Backend proxy that keeps `client_id` / `client_secret` server-side
-
-## Prerequisites
-
-- Flutter SDK (latest stable)
-- Dart SDK (included with Flutter)
-- A BlinkPay Sandbox account — [Merchant Portal](https://merchants.blinkpay.co.nz/settings/api)
-- Android Studio or VS Code with Flutter extensions
-- Xcode (for iOS, macOS only) — minimum iOS 13.0
+This is a reference implementation, not an SDK. Read the code, then build the same thing into your own app and backend.
 
 ## Quick Start
 
 ```bash
-git clone <repository-url>
-cd blinkpay_flutter_mobile_app_demo
+git clone https://github.com/BlinkPay/BlinkPay-Flutter-Demo.git
+cd BlinkPay-Flutter-Demo
 flutter pub get
 cp server/.env.example server/.env
-# Edit server/.env with your BlinkPay sandbox credentials (see below)
+# Edit server/.env with your sandbox credentials (see below)
 ./run.sh
 ```
 
-The script installs server dependencies, prompts for your target device, starts the proxy server, and launches the Flutter app. You can skip the prompt with `./run.sh --simulator`, `--emulator`, or `--lan`.
+The script installs the server dependencies, asks which device you are using, starts the backend and launches the app. Skip the prompt with `./run.sh --simulator`, `--emulator` or `--lan`.
 
-### BlinkPay credentials
+### Credentials
 
-Edit `server/.env` with your sandbox credentials:
+Edit `server/.env`:
 
 ```
 BLINKPAY_API_URL=sandbox.debit.blinkpay.co.nz
 BLINKPAY_CLIENT_ID=your_client_id_here
 BLINKPAY_CLIENT_SECRET=your_client_secret_here
-APP_API_KEY=                              # Leave empty — run.sh will auto-generate one
+APP_API_KEY=                              # Leave empty: run.sh generates one
 SERVER_PORT=4567
+UNIT_PRICE=1.00
 ```
 
-To get these: log into the [BlinkPay Merchant Portal](https://merchants.blinkpay.co.nz/settings/api), go to Settings > API, add `blinkpaydemo://callback` to your redirect URIs, copy the Client ID, and rotate/copy the secret.
+In the [Merchant Portal](https://merchants.blinkpay.co.nz/settings/api), under Settings > API, add `blinkpaydemo://callback` to your redirect URIs, copy the client ID, and rotate and copy the secret.
+
+To try it in the sandbox, choose **PNZ** at the gateway and log in as `user01` with password `password`. The PNZ page lets you approve or decline.
 
 <details>
 <summary>Manual setup (without run.sh)</summary>
 
-**Terminal 1 — Start the server:**
+**Terminal 1: the backend**
 
 ```bash
 cd server && dart pub get && dart run bin/server.dart
 ```
 
-**Terminal 2 — Start the Flutter app:**
+**Terminal 2: the app**
 
 ```bash
 flutter run \
@@ -70,81 +56,113 @@ flutter run \
   --dart-define=APP_API_KEY=your_api_key_from_server_env
 ```
 
-Use the appropriate `BACKEND_URL` for your device:
+Use the right `BACKEND_URL` for your device:
 
 | Device | `BACKEND_URL` |
 |---|---|
-| Android Emulator | `http://10.0.2.2:4567` |
-| iOS Simulator | `http://localhost:4567` |
+| Android emulator | `http://10.0.2.2:4567` |
+| iOS simulator | `http://localhost:4567` |
 | Physical device (USB or same network) | `http://<your-lan-ip>:4567` |
 
 To find your LAN IP: `ipconfig getifaddr en0` (macOS) or `hostname -I` (Linux).
 
 </details>
 
+## Architecture
+
+```
+Mobile app  ──(your own auth)──>  Your backend  ──(OAuth2 client credentials)──>  Blink Payments API
+(no secrets, no prices)           (credentials, orders, amounts, PCR)
+```
+
+**The backend holds the credentials.** The Blink Payments `client_id` and `client_secret` live only on the server. The app binary contains no Blink Payments secret, so it cannot be extracted from it.
+
+**The backend owns the amount and the PCR.** The app sends what is in the cart (here, a quantity); the server prices it from its own data (`UNIT_PRICE`), creates the order, and builds every consent and payment request itself: the amount, the PCR (particulars, code and reference that appear on bank statements) and the redirect URI. The app never chooses what it is charged, and it can only reach the consent and payments of an order it created. The app's own price is for display only.
+
+**The app authenticates to the backend.** This demo uses a static API key (`APP_API_KEY`) to show where that check goes. **Production apps need real user authentication** (your own login, OAuth2/OIDC, session tokens), so that each order belongs to a signed-in customer.
+
+### Backend endpoints
+
+All under `/api/`, all requiring `Authorization: Bearer <APP_API_KEY>`:
+
+| Method | Path | Does |
+|---|---|---|
+| POST | `/orders` `{"quantity": n}` | Prices the cart and creates an order |
+| POST | `/orders/<order_id>/consent` `{"type": "single" \| "enduring"}` | Creates a gateway consent for the order (needs `idempotency-key`) |
+| GET | `/orders/<order_id>/consent` | Reads the consent and its `payments` |
+| DELETE | `/orders/<order_id>/consent` | Revokes the consent (customer cancelled) |
+| POST | `/orders/<order_id>/payments` | Creates the payment (needs `idempotency-key`) |
+| GET | `/orders/<order_id>/payments/<payment_id>` | Reads the payment, if it belongs to the order |
+
+Orders are kept in memory, so they are lost when the server restarts. A real backend stores orders, consent IDs and payment IDs in its database.
+
 ## Payment Flow
 
 ```mermaid
 sequenceDiagram
     participant App
-    participant Proxy as Proxy Server
-    participant BP as BlinkPay API
-    participant Bank as Bank / Gateway
+    participant Backend
+    participant BP as Blink Payments
+    participant Bank as Gateway / Bank
 
-    App->>Proxy: 1. Create consent (+ API key)
-    Proxy->>BP: 2. Forward request (+ OAuth2 token)
-    BP-->>Proxy: 3. {consent_id, redirect_uri}
-    Proxy-->>App: 4. {consent_id, redirect_uri}
-    App->>Bank: 5. Open redirect_uri (Custom Tab)
-    Note over Bank: User authorises payment
-    Bank-->>App: 6. Deep link: blinkpaydemo://callback?cid=xxx
-    App->>Proxy: 7. Check consent status
-    Proxy->>BP: 8. Get consent
-    BP-->>Proxy: 9. {status: Authorised}
-    Proxy-->>App: 10. {status: Authorised}
-    App->>Proxy: 11. Create payment
-    Proxy->>BP: 12. Forward payment
-    BP-->>Proxy: 13. {payment_id}
-    Proxy-->>App: 14. {payment_id}
-    App->>App: 15. Poll until payment completes
+    App->>Backend: Create order (cart)
+    Backend-->>App: order_id, amount
+    App->>Backend: Create consent (order_id, type, idempotency-key)
+    Backend->>BP: Create gateway consent (amount, PCR, redirect URI)
+    BP-->>Backend: consent_id, redirect_uri
+    Backend-->>App: redirect_uri
+    App->>Bank: Open redirect_uri in the in-app browser
+    loop Every 3 s until a terminal status
+        App->>Backend: Read consent
+    end
+    Note over Bank: Customer chooses a bank and approves
+    Bank-->>App: blinkpaydemo://callback?cid=…
+    App->>Backend: Create payment (idempotency-key)
+    Backend->>BP: Create payment
+    loop Every 30 s, up to 2 minutes
+        App->>Backend: Read payment
+    end
 ```
 
-Deep links (`blinkpaydemo://callback`) go directly from the bank back to the app — they don't pass through the proxy.
+### In-app browser, not a WebView
 
-## Security Notes
+The gateway opens in **SFSafariViewController** on iOS and **Chrome Custom Tabs** on Android, through [`flutter_custom_tabs`](https://pub.dev/packages/flutter_custom_tabs). The app cannot read or change the bank's pages there, and the customer gets the system browser's cookies and saved passwords. WebViews are technically possible but not recommended, and iframes do not work at all because bank content security policies block them. In other frameworks use the equivalent: `SFSafariViewController` in Swift, Custom Tabs (`androidx.browser`) in Kotlin, and an in-app browser package such as `expo-web-browser` in React Native.
 
-> **This is a demo using BlinkPay's sandbox environment.** It demonstrates the correct architecture for mobile-to-BlinkPay integration. App-to-server auth is simplified for demo purposes.
+### Returning to the app
 
-**What the demo gets right:**
-- BlinkPay `client_id` and `client_secret` are held server-side only
-- The app binary contains zero BlinkPay secrets
-- API calls are proxied through the backend
-- App-to-server auth is demonstrated via a shared API key
+The consent's `redirect_uri` is a custom scheme (`blinkpaydemo://callback`) registered by the app. When the customer finishes, the gateway opens it with the consent ID in `cid`, and the app checks the status. The return URL says nothing reliable about the outcome, even when it carries an `error`: the app always reads the consent status from the backend. The customer may also come back by switching apps or closing the browser without any return URL, so the app checks again whenever it returns to the foreground.
 
-**What production apps should add:**
-- Proper app-to-server authentication (OAuth2, JWT, session tokens)
-- HTTPS/TLS between app and backend (this demo uses HTTP)
-- Rate limiting, request validation, and input sanitisation on the server
-- Hosted backend deployment (not localhost)
-- Secrets manager for server-side credentials
+## Outcome Handling
+
+The rules the app follows, from the Blink Payments consent and payment lifecycle docs:
+
+- **Only `AcceptedSettlementCompleted` means paid; `Rejected` means failed.** `Pending` and `AcceptedSettlementInProcess` mean the payment is in flight. A `Consumed` consent only means a payment was made with it, not that the payment succeeded.
+- **Waiting for the customer is not a failure.** While the consent is `GatewayAwaitingSubmission` or `AwaitingAuthorisation`, the customer may still approve it, perhaps in their banking app. The app checks the consent **no more often than every 3 seconds** until it reaches a terminal status. It never revokes it or reports a failure on its own. Bank authorisation windows are 4 to 10 minutes, and the gateway gives the customer 15 minutes to choose a bank, so the app keeps checking for 15 minutes.
+- **Settlement takes time.** Once the payment exists the app checks it **every 30 seconds** for up to 2 minutes. Settlement usually takes 1 to 2 hours and, late in the day, can wait until the next morning. If the payment has not settled by then, the app shows that it is still processing and stops. It does not revoke anything or call it failed.
+- **The backend decides the final outcome.** Mobile apps get closed. A production backend keeps polling the payment every 30 to 60 seconds, and runs a periodic wash-up over payments still `Pending` or `AcceptedSettlementInProcess` (every 12 hours is a sensible default), before marking orders paid.
+- **The customer can cancel before approving.** Cancel revokes the consent so it cannot be approved later. If the revoke is refused because a payment already exists (`409`) or the consent has already ended (`422`), the app reads the outcome instead of assuming it.
+
+## Retries and Idempotency
+
+- **One idempotency key per payment attempt.** The app sends a fresh UUID in the `idempotency-key` header when it creates a consent or a payment, and the backend forwards it to Blink Payments. Every retry of that attempt reuses the same key, including retries from a later check or after the app resumes, so a timeout followed by a retry returns the original payment instead of creating a second one.
+- **At most 2 retries.** `5xx` responses and network failures back off exponentially (0.5 s, then 1 s). A `429` waits for its `Retry-After` header. Any other `4xx` is never retried, because sending the same request again cannot fix it. A POST is only retried when it carries an idempotency key.
+- **Messages come from the error code.** Blink Payments errors carry a `code` such as `BP214` or `BP036`. The app chooses the customer's message from that code, then from the HTTP status, and never from the wording of the `message`.
 
 ## Deep Linking Setup
 
-After the user authorises a payment at their bank, BlinkPay redirects back to the app via a custom URL scheme (`blinkpaydemo://callback` in this demo). This requires platform-specific configuration that you'll need to replicate in your own project.
+The return to the app needs platform configuration that you will need in your own project.
 
 ### Flutter dependencies
 
-Add these to your `pubspec.yaml`:
-
 ```yaml
 dependencies:
-  flutter_custom_tabs: ^2.5.0   # Opens bank redirect in Chrome Custom Tab / SFSafariViewController
+  flutter_custom_tabs: ^2.5.0   # Chrome Custom Tabs / SFSafariViewController
   app_links: ^7.0.0             # Listens for incoming deep links
 ```
 
-### Android — `android/app/src/main/AndroidManifest.xml`
+### Android: `android/app/src/main/AndroidManifest.xml`
 
-Add an intent filter inside your `<activity>` tag so Android routes your scheme to the app:
+Add an intent filter inside your `<activity>` so Android routes your scheme to the app:
 
 ```xml
 <activity android:name=".MainActivity" android:launchMode="singleTop" ... >
@@ -158,7 +176,7 @@ Add an intent filter inside your `<activity>` tag so Android routes your scheme 
 </activity>
 ```
 
-Also add under `<manifest>` to allow opening HTTPS URLs in Custom Tabs:
+Also add under `<manifest>` so the app can open HTTPS URLs in Custom Tabs:
 
 ```xml
 <uses-permission android:name="android.permission.INTERNET"/>
@@ -172,9 +190,9 @@ Also add under `<manifest>` to allow opening HTTPS URLs in Custom Tabs:
 </queries>
 ```
 
-> **Note:** `android:launchMode="singleTop"` is important — without it, the deep link may open a second instance of your activity instead of returning to the existing one.
+> **Note:** `android:launchMode="singleTop"` matters: without it, the deep link may open a second instance of your activity instead of returning to the existing one.
 
-### iOS — `ios/Runner/Info.plist`
+### iOS: `ios/Runner/Info.plist`
 
 Register your URL scheme so iOS routes it to the app:
 
@@ -192,9 +210,9 @@ Register your URL scheme so iOS routes it to the app:
 </array>
 ```
 
-### iOS — `ios/Runner/AppDelegate.swift` (auto-dismiss Safari)
+### iOS: `ios/Runner/AppDelegate.swift` (close Safari on return)
 
-When the bank redirects back, `SFSafariViewController` stays on screen unless explicitly dismissed. Without this, users have to manually tap "Done". Add this to your `AppDelegate`:
+When the gateway redirects back, `SFSafariViewController` stays on screen unless it is dismissed. Without this, customers have to tap Done. Add this to your `AppDelegate`:
 
 ```swift
 import SafariServices
@@ -224,53 +242,81 @@ func dismissSafariViewControllerIfPresent() {
 }
 ```
 
-> **Note:** The 0.1s delay ensures the app is fully foregrounded before attempting to dismiss. Requires iOS 13.0+ deployment target (for `connectedScenes`).
+> **Note:** The 0.1 s delay lets the app finish coming to the foreground before it dismisses Safari. Requires an iOS 13.0+ deployment target (for `connectedScenes`).
 
-### BlinkPay redirect URI
+### Redirect URI registration
 
-Whatever scheme you choose, register it as a redirect URI in the [BlinkPay Merchant Portal](https://merchants.blinkpay.co.nz/settings/api) under Settings > API. The URI must match exactly (e.g. `your_scheme://callback`).
+Whatever scheme you choose, register it as a redirect URI in the [Merchant Portal](https://merchants.blinkpay.co.nz/settings/api) under Settings > API, and set it as `APP_REDIRECT_URI` on the backend. It must match exactly (for example `your_scheme://callback`). For production, contact support@blinkpay.co.nz so the banks can whitelist it.
+
+## Security Notes
+
+> **This demo uses the Blink Payments sandbox.** The architecture is the one to copy; the app-to-backend authentication is simplified.
+
+**What the demo does:**
+- Keeps the Blink Payments `client_id` and `client_secret` on the server only
+- Prices orders and sets the PCR and redirect URI on the server
+- Scopes every consent and payment call to an order the app created
+- Sends idempotency keys on consent and payment creation
+
+**What production apps add:**
+- Real user authentication between the app and the backend, and orders tied to the signed-in customer
+- HTTPS/TLS between the app and the backend (this demo uses HTTP on your local network)
+- Orders, consents and payments stored in a database, with server-side outcome tracking and a wash-up
+- Rate limiting and request validation on the backend
+- A secrets manager for the server's credentials
+- PCR values without customer personal data (they appear on bank statements)
 
 ## Project Structure
 
 ```
 .
 ├── lib/                              # Flutter app
-│   ├── main.dart                     # Entry point and main UI
-│   ├── blinkpay_service.dart         # HTTP client (calls proxy, NOT BlinkPay)
+│   ├── main.dart                     # Entry point, UI, lifecycle and deep-link wiring
+│   ├── blinkpay_service.dart         # Backend client: retries, idempotency keys, error codes
 │   ├── env.dart                      # Config from --dart-define (no secrets)
 │   ├── constants.dart                # App constants
 │   ├── handlers/
 │   │   └── deep_link_handler.dart    # Deep link listener
 │   ├── managers/
-│   │   └── payment_manager.dart      # Payment flow state machine
+│   │   └── payment_manager.dart      # Payment flow: polling and outcome handling
 │   ├── models/
+│   │   ├── payment_models.dart       # Statuses and API result types
 │   │   └── shopping_cart_model.dart  # Cart state
 │   ├── utils/
 │   │   ├── log.dart                  # Logging utility
-│   │   └── payment_error_helper.dart # Error formatting
+│   │   └── payment_error_helper.dart # Customer messages by error code
 │   └── widgets/
 │       ├── loading_overlay.dart      # Loading spinner overlay
 │       ├── payment_buttons.dart      # PayNow / AutoPay buttons
-│       ├── product_card.dart         # Product display with cart controls
-│       └── status_indicator.dart     # Payment status icon
-├── server/                           # Dart Shelf proxy server
+│       ├── payment_status_panel.dart # Payment progress, Cancel and OK
+│       └── product_card.dart         # Product display with cart controls
+├── server/                           # Dart Shelf backend
 │   ├── bin/server.dart               # Server entry point
 │   ├── lib/src/
 │   │   ├── config.dart               # Server config from .env
-│   │   ├── blinkpay_client.dart      # BlinkPay API client (OAuth2 tokens)
+│   │   ├── blinkpay_client.dart      # Blink Payments API client (OAuth2 tokens)
+│   │   ├── orders.dart               # Orders, pricing and PCR
 │   │   ├── middleware/
-│   │   │   └── auth_middleware.dart   # API key validation
+│   │   │   └── auth_middleware.dart  # API key check
 │   │   └── routes/
-│   │       ├── consent_routes.dart   # Consent proxy endpoints
-│   │       └── payment_routes.dart   # Payment proxy endpoints
+│   │       └── order_routes.dart     # Order, consent and payment endpoints
+│   ├── test/                         # Backend tests
 │   ├── .env                          # Server secrets (git-ignored)
 │   ├── .env.example                  # Template
 │   └── pubspec.yaml                  # Server dependencies
-├── run.sh                            # Start server + app together
+├── test/                             # App tests
+├── run.sh                            # Starts the backend and the app together
 ├── pubspec.yaml                      # Flutter app dependencies
 └── README.md
 ```
 
+## Tests
+
+```bash
+flutter test                 # App: outcome handling, retries, idempotency, error messages
+cd server && dart test       # Backend: pricing, PCR, idempotency-key forwarding, ownership
+```
+
 ## License
 
-This project is licensed under the MIT License — see the LICENSE file for details.
+This project is licensed under the MIT License. See the LICENSE file for details.

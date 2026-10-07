@@ -99,6 +99,11 @@ if [[ -z "$APP_API_KEY" || "$APP_API_KEY" == "<"* ]]; then
   fi
 fi
 
+# ─── Values the app shows or matches, owned by the server ───────────
+# The server prices orders from UNIT_PRICE; the app only displays it.
+UNIT_PRICE=$(grep '^UNIT_PRICE=' "$SERVER_DIR/.env" | cut -d'=' -f2- || true)
+APP_REDIRECT_URI=$(grep '^APP_REDIRECT_URI=' "$SERVER_DIR/.env" | cut -d'=' -f2- || true)
+
 # ─── Detect backend URL based on mode ────────────────────────────────
 detect_lan_ip() {
   if [[ "$OSTYPE" == darwin* ]]; then
@@ -181,4 +186,6 @@ echo "[3/3] Starting Flutter app..."
 echo ""
 (cd "$PROJECT_DIR" && flutter run \
   --dart-define="BACKEND_URL=$BACKEND_URL" \
-  --dart-define="APP_API_KEY=$APP_API_KEY")
+  --dart-define="APP_API_KEY=$APP_API_KEY" \
+  --dart-define="UNIT_PRICE=${UNIT_PRICE:-1.00}" \
+  --dart-define="APP_REDIRECT_URI=${APP_REDIRECT_URI:-blinkpaydemo://callback}")
