@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 
+import '../models/payment_models.dart';
+
 /// Displays the PayNow and AutoPay buttons.
 class PaymentButtons extends StatelessWidget {
   final bool isDisabled;
-  final Function(String type) onButtonClick;
+  final void Function(ConsentType type) onButtonClick;
 
   const PaymentButtons({
     super.key,
@@ -24,7 +26,9 @@ class PaymentButtons extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             textStyle: const TextStyle(fontSize: 14),
           ),
-          onPressed: isDisabled ? null : () => onButtonClick('single'),
+          onPressed: isDisabled
+              ? null
+              : () => onButtonClick(ConsentType.single),
           icon: const Icon(Icons.shopping_cart),
           label: const Text('PayNow'),
         ),
@@ -35,7 +39,9 @@ class PaymentButtons extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             textStyle: const TextStyle(fontSize: 14),
           ),
-          onPressed: isDisabled ? null : () => onButtonClick('enduring'),
+          onPressed: isDisabled
+              ? null
+              : () => onButtonClick(ConsentType.enduring),
           icon: const Icon(Icons.shopping_cart),
           label: const Text('AutoPay'),
         ),

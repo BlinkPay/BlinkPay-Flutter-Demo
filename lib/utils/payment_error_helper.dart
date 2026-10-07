@@ -1,40 +1,77 @@
-/// Provides helper functions for handling payment-related errors.
+import '../blinkpay_service.dart';
+import '../models/payment_models.dart';
+
+/// Chooses the customer-facing message for an error or a failed outcome.
+///
+/// Branches on the Blink Payments error `code` (see the Error Codes reference
+/// in the docs), then on the HTTP status, never on the wording of a message:
+/// messages are for developers and can change.
 class PaymentErrorHelper {
-  /// Converts a raw error message string into a user-friendly message.
-  static String getUserFriendlyMessage(String errorMessage) {
-    // Convert to lowercase for case-insensitive matching
-    final lowerCaseError = errorMessage.toLowerCase();
+  static const String expired =
+      'This payment request has expired. Please start again.';
+  static const String cancelled =
+      'This payment was cancelled. No money has been taken.';
+  static const String bankDeclined =
+      'Your bank declined the payment. No money has been taken.';
+  static const String overLimit =
+      'This amount is over the payment limit for your bank.';
+  static const String bankUnavailable =
+      'Your bank is temporarily unavailable. Please try again shortly.';
+  static const String notSetUp =
+      'Payments are not set up correctly for this app. Please contact the merchant.';
+  static const String busy =
+      'We are receiving a lot of requests. Please wait a moment and try again.';
+  static const String serviceUnavailable =
+      'The payment service is having problems. Please try again shortly.';
+  static const String network =
+      'Network error. Please check your internet connection and try again.';
+  static const String generic =
+      'Something went wrong setting up the payment. Please try again.';
 
-    // Simplified Error Categories:
+  static const Map<String, String> _byCode = {
+    'BP002': expired,
+    'BP003': expired,
+    'BP004': expired,
+    'BP021': expired,
+    'BP025': expired,
+    'BP015': cancelled,
+    'BP701': cancelled,
+    'BP036': bankDeclined,
+    'BP229': overLimit,
+    'BP277': overLimit,
+    'BP287': overLimit,
+    'BP214': notSetUp,
+    'BP216': notSetUp,
+    'invalid_api_key': notSetUp,
+    'BP601': bankUnavailable,
+    'order_not_found': expired,
+  };
 
-    // 1. Authentication / Consent Related
-    if (lowerCaseError.contains('token') ||
-        lowerCaseError.contains('authentication') ||
-        lowerCaseError.contains('consent')) {
-      return 'There was an issue setting up or authorizing the payment with your bank. Please try again.';
+  /// The message for an error thrown by [BlinkPayService].
+  static String forError(Object error) {
+    if (error is BlinkPayNetworkException) return network;
+    if (error is! BlinkPayApiException) return generic;
+
+    final byCode = _byCode[error.code];
+    if (byCode != null) return byCode;
+    if (error.statusCode == 429) return busy;
+    if (error.statusCode >= 500) return serviceUnavailable;
+    return generic;
+  }
+
+  /// The message for a consent that ended without a payment.
+  static String forConsentStatus(String? status) {
+    switch (status) {
+      case ConsentStatus.rejected:
+        return 'The payment was declined or not approved in time. '
+            'No money has been taken.';
+      case ConsentStatus.gatewayTimeout:
+        return 'The payment session expired before a bank was chosen. '
+            'Please start again.';
+      case ConsentStatus.revoked:
+        return cancelled;
+      default:
+        return generic;
     }
-
-    // 2. Verification / Timeout Related
-    if (lowerCaseError.contains('timeout') ||
-        lowerCaseError.contains('verify') ||
-        lowerCaseError.contains('verification')) {
-      return 'Payment status check timed out or failed. Please check your bank app/account before retrying.';
-    }
-
-    // 3. Network Related
-    if (lowerCaseError.contains('network') ||
-        lowerCaseError.contains('socket') ||
-        lowerCaseError.contains('connection')) {
-      return 'Network error. Please check your internet connection and try again.';
-    }
-
-    // 4. Browser/App Launch Related
-    if (lowerCaseError.contains('browser') ||
-        lowerCaseError.contains('launch')) {
-      return 'Could not open the bank app or website. Please ensure you have the necessary apps installed and try again.';
-    }
-
-    // 5. Generic Fallback
-    return 'An unexpected error occurred during the payment process. Please try again later.';
   }
 }

@@ -2,23 +2,21 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_custom_tabs/flutter_custom_tabs.dart' as custom_tabs;
-import 'package:timezone/data/latest.dart' as tz;
 
 import './blinkpay_service.dart';
 import './env.dart';
+import './models/payment_models.dart';
 import './models/shopping_cart_model.dart';
 import './handlers/deep_link_handler.dart';
 import './managers/payment_manager.dart';
 import './utils/log.dart';
 import './widgets/product_card.dart';
 import './widgets/payment_buttons.dart';
+import './widgets/payment_status_panel.dart';
 import './widgets/loading_overlay.dart';
 
-/// Initialize the app: set up timezones and validate configuration
+/// Validates configuration and starts the app.
 Future<void> main() async {
-  // Initialise the timezone database.
-  tz.initializeTimeZones();
-
   // Validate that required --dart-define values are present
   if (!Environment.isValid()) {
     Log.error("CRITICAL ERROR: Backend configuration not set.");
@@ -154,15 +152,10 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     Log.info("BlinkPayDemoState initializing...");
     super.initState();
     
-    // Instantiate PaymentManager, passing dependencies and UI callbacks
     _paymentManager = PaymentManager(
       blinkPayService: _blinkPayService,
       cartModel: _cartModel,
-      showSnackBarCallback: _showSnackBar,
-      handleApiErrorCallback: _handleApiError,
     );
-
-    // Listen for payment state changes to handle URL launching
     _paymentManager.addListener(_onPaymentManagerChanged);
 
     // Initialize DeepLinkHandler with callbacks that use PaymentManager
@@ -212,99 +205,33 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     setState(() {});
   }
 
-  /// Handles app lifecycle state changes (uses PaymentManager)
+  /// Coming back to the foreground (for example from the banking app) is a
+  /// reason to check the payment again, never to give up on it.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final consentId = _paymentManager.consentIdForVerification;
-    final consentType = _paymentManager.consentTypeForVerification;
-    final currentState = _paymentManager.state;
     Log.info("App lifecycle state changed: $state");
-
     if (state == AppLifecycleState.resumed) {
-      // Always mark the tab as potentially closed when resuming
-      _paymentManager.setCustomTabClosed();
-
-      // Check if we are *still* waiting for the redirect when the app resumes.
-      // This handles cases where the deep link might not have triggered the check.
-      if (currentState == PaymentState.awaitingRedirect &&
-          consentId != null &&
-          consentType != null) {
-        Log.info(
-            "Resuming app while still awaiting redirect for $consentId ($consentType). Triggering status check.");
-        // Call checkConsentStatus. It has internal checks to prevent running multiple times
-        // or in the wrong state.
-        _paymentManager.checkConsentStatus(consentId, consentType);
-      } else {
-        Log.info(
-            "Resuming app, but not in awaitingRedirect state (Current: $currentState) or no consent details. No action needed from lifecycle handler.");
-        // DO NOTHING in the else block - avoid resetting state prematurely.
-      }
-    } else if (state == AppLifecycleState.paused) {
-      // Only reset if we're awaiting redirect and the custom tab isn't open.
-      // Don't reset during creatingConsent or verifying — those are transient
-      // states where a brief pause (notification drawer, permission dialog)
-      // should not abort the flow.
-      if (currentState == PaymentState.awaitingRedirect &&
-          consentId != null &&
-          !_paymentManager.isCustomTabOpen) {
-        Log.info("Pausing app unexpectedly during awaitingRedirect, resetting.");
-        _showSnackBar(false, 'Payment process interrupted');
-        _paymentManager.resetPaymentState();
-      } else if (_paymentManager.isCustomTabOpen) {
-        Log.info(
-            'App pausing, likely due to custom tab being active. State maintained.');
-      }
+      _paymentManager.onAppResumed();
     }
   }
 
-  /// Callback for DeepLinkHandler when a link is successfully parsed.
+  /// Called when the gateway sends the customer back to the app.
   void _handleDeepLinkData(
       String? consentIdFromUri, String? error, String? errorDescription) {
-    Log.info(
-        '[iOS Deep Link Check] _handleDeepLinkData received. URI Consent: $consentIdFromUri, Error: $error');
-    Log.info(
-        'Handling deep link data. Consent: $consentIdFromUri, Error: $error');
+    Log.info('Return link: consent $consentIdFromUri, error $error');
     if (!mounted) return;
-    
-    final currentConsent = _paymentManager.consentIdForVerification;
-    final currentConsentType = _paymentManager.consentTypeForVerification;
-
-    if (error != null) {
-      String errorMessage = Uri.decodeComponent(errorDescription ?? error);
-      Log.info('Deep link contained error: $errorMessage');
-      _handleApiError('Payment failed: $errorMessage');
-      _paymentManager.resetPaymentState();
-    } else if (currentConsent != null &&
-        currentConsentType != null &&
-        (consentIdFromUri == null || consentIdFromUri == currentConsent)) {
-      Log.info(
-          'Deep link success/no consent ID. Checking status via manager for $currentConsent ($currentConsentType)...');
-      _paymentManager.checkConsentStatus(currentConsent, currentConsentType);
-    } else if (consentIdFromUri == null && error == null) {
-      // Handle case where redirect happened without error but is missing the consent ID
-      Log.error(
-          'Redirect received successfully but missing required consent ID.');
-      _showSnackBar(
-          false, 'Payment failed: Invalid redirect received from bank.');
-      _paymentManager.resetPaymentState();
-    } else {
-      // Stale or mismatched deep link — ignore it rather than disrupting
-      // an active payment flow.
-      Log.info(
-          'Ignoring deep link: no active consent or ID mismatch. URI Consent: $consentIdFromUri, Current: $currentConsent ($currentConsentType)');
-    }
+    _paymentManager.onReturnFromBank(consentId: consentIdFromUri);
   }
-  
-  /// Callback for DeepLinkHandler when an error occurs in the stream.
+
+  /// A broken return link changes nothing: the payment is still checked.
   void _handleDeepLinkError(String errorMessage) {
-    Log.error('Deep link listener error reported to State: $errorMessage');
-    if (mounted) {
-      _showSnackBar(false, 'Error processing redirect link.');
-      _paymentManager.resetPaymentState();
-    }
+    Log.error('Deep link listener error: $errorMessage');
   }
 
-  /// Internal implementation for launching URL, passed to PaymentManager
+  /// Opens [url] in Chrome Custom Tabs (Android) or SFSafariViewController
+  /// (iOS) rather than a WebView: the app cannot read or alter the bank's
+  /// pages, and the customer gets the system browser's cookies and password
+  /// autofill. iframes do not work at all (bank CSPs block them).
   Future<void> _launchUrlInternal(BuildContext context, String url) async {
     if (!mounted) {
       Log.info("Skipping _launchUrlInternal as widget is not mounted.");
@@ -337,64 +264,26 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
     );
   }
 
-  // ====== UI HELPERS (Remain in State for now) ======
-  // These are passed as callbacks to PaymentManager
+  /// Starts a payment and opens the gateway in the in-app browser.
+  Future<void> _handlePaymentButtonClick(ConsentType type) async {
+    final redirectUrl = await _paymentManager.start(type);
+    if (redirectUrl == null || !mounted) return;
 
-  /// Displays snackbar message with success/failure styling
-  void _showSnackBar(bool success, String message) {
-    Log.info("Showing SnackBar: Success=$success, Message=$message");
-    if (!mounted) return;
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: success ? Colors.green : Colors.red,
-        duration: const Duration(seconds: 3),
-      ),
-    );
-  }
-
-  /// Handles API errors by displaying them in a snackbar
-  void _handleApiError(String message) {
-    Log.error('API Error reported to UI: $message');
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), backgroundColor: Colors.red),
-    );
-  }
-
-  /// Handle payment button clicks and initiate payment flow
-  Future<void> _handlePaymentButtonClick(String type) async {
-    if (!mounted) return;
-
-    // Get redirect URL from payment manager
-    final redirectUrl = await _paymentManager.handleButtonClick(type);
-
-    // If we got a redirect URL and still mounted, launch it
-    if (redirectUrl != null && mounted) {
-      final consentId = _paymentManager.consentIdForVerification;
-      _paymentManager.markCustomTabOpen();
-
-      try {
-        Log.info('Launching Redirect URL: $redirectUrl for consent $consentId');
-        await _launchUrlInternal(context, redirectUrl);
-      } catch (e, stacktrace) {
-        Log.error('Error launching URL for consent $consentId', e, stacktrace);
-        if (mounted) {
-          _paymentManager.onLaunchError(consentId, e.toString());
-        }
-      }
+    try {
+      Log.info('Opening the gateway for consent ${_paymentManager.consentId}');
+      await _launchUrlInternal(context, redirectUrl);
+      _paymentManager.onBrowserOpened();
+    } catch (e) {
+      _paymentManager.onBrowserFailed(e);
     }
   }
 
   // ====== MAIN UI BUILD ======
   @override
   Widget build(BuildContext context) {
-    // UI state derived from PaymentManager
-    bool buttonsDisabled =
-        _paymentManager.isLoading || _paymentManager.isDisabled;
-    bool showLoadingOverlay = _paymentManager.isLoading;
+    final buttonsDisabled = _paymentManager.isBusy ||
+        _paymentManager.state == PaymentState.unresolved;
+    final showLoadingOverlay = _paymentManager.state == PaymentState.starting;
 
     return Scaffold(
       appBar: AppBar(
@@ -420,18 +309,22 @@ class _BlinkPayDemoState extends State<BlinkPayDemo> with WidgetsBindingObserver
 
                   PaymentButtons(
                     isDisabled: buttonsDisabled,
-                    onButtonClick: (type) => _handlePaymentButtonClick(type),
+                    onButtonClick: _handlePaymentButtonClick,
+                  ),
+                  const SizedBox(height: 20),
+
+                  PaymentStatusPanel(
+                    state: _paymentManager.state,
+                    message: _paymentManager.message,
+                    canCancel: _paymentManager.canCancel,
+                    onCancel: _paymentManager.cancel,
+                    onDismiss: _paymentManager.dismiss,
                   ),
                 ],
               ),
             ),
           ),
-          LoadingOverlay(
-            isLoading: showLoadingOverlay,
-            message: _paymentManager.state == PaymentState.verifying
-                ? 'Checking payment status...'
-                : 'Processing...',
-          ),
+          LoadingOverlay(isLoading: showLoadingOverlay),
         ],
       ),
     );
