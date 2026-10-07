@@ -32,14 +32,16 @@ class Environment {
   /// -----------------------------------------------------------------------
   static const String appApiKey = String.fromEnvironment('APP_API_KEY');
 
-  /// Redirect URI for deep linking after bank authorization.
-  /// This is not a secret — it's a URL scheme registered in the app manifest.
+  /// The return URL the backend sends to Blink Payments (its
+  /// `APP_REDIRECT_URI`), used here to recognise the deep link. The scheme is
+  /// registered in AndroidManifest.xml and Info.plist.
   static const String redirectUri = String.fromEnvironment(
     'APP_REDIRECT_URI',
     defaultValue: 'blinkpaydemo://callback',
   );
 
-  /// Unit price for the demo product.
+  /// Unit price shown in the cart. Display only: the backend prices the
+  /// order from its own `UNIT_PRICE`, and `run.sh` passes that value here.
   static const String unitPrice = String.fromEnvironment(
     'UNIT_PRICE',
     defaultValue: '1.00',

@@ -1,437 +1,457 @@
 import 'dart:async';
-import 'package:flutter/material.dart'; // For ChangeNotifier, BuildContext
+
+import 'package:flutter/foundation.dart';
+import 'package:uuid/uuid.dart';
 
 import '../blinkpay_service.dart';
+import '../models/payment_models.dart';
 import '../models/shopping_cart_model.dart';
-import '../constants.dart';
-// Utils
 import '../utils/log.dart';
 import '../utils/payment_error_helper.dart';
 
-/// Sentinel value meaning "don't change this field" in [PaymentManager._updateState].
-const String _unchanged = '\x00_UNCHANGED';
-
-/// Represents the different stages of the payment process.
+/// Where the payment flow is.
 enum PaymentState {
-  idle, // Initial state, ready for interaction
-  creatingConsent, // API call to create consent in progress
-  awaitingRedirect, // Consent created, waiting for user interaction via custom tab/browser
-  verifying, // User returned, checking consent status and processing payment
-  error, // An error occurred at some stage
+  idle,
+  starting,
+
+  /// The customer is at the gateway or their bank; checking the consent.
+  awaitingAuthorisation,
+
+  /// A payment exists; checking it until the bank settles it.
+  paymentProcessing,
+
+  /// The payment reached `AcceptedSettlementCompleted`.
+  succeeded,
+
+  /// Definitely not paid: rejected, expired, or never created.
+  failed,
+
+  /// The customer cancelled before approving and the consent was revoked.
+  cancelled,
+
+  /// We stopped checking without a final answer. Not a failure: the outcome
+  /// is still to come, and the backend must keep tracking it.
+  unresolved,
 }
 
-/// Manages the state and logic for the entire payment flow.
+/// How often and how long the app checks. The defaults follow the Blink
+/// Payments docs: a consent no more than every 2-3 s, a payment every 30-60 s.
+class PaymentTimings {
+  final Duration consentPollInterval;
+
+  /// The Gateway's session cutoff: how long the customer has to choose a
+  /// bank, counted from consent creation.
+  final Duration gatewayWaitLimit;
+
+  /// How long to keep checking once the customer has reached their bank.
+  /// The bank's own window (4-10 minutes, per bank and flow) starts then, so
+  /// this runs after the gateway time rather than inside it.
+  final Duration bankWaitLimit;
+  final Duration paymentPollInterval;
+
+  /// Settlement can take hours. The app watches for this long, then leaves
+  /// the outcome to the backend.
+  final Duration paymentWaitLimit;
+
+  const PaymentTimings({
+    this.consentPollInterval = const Duration(seconds: 3),
+    this.gatewayWaitLimit = const Duration(minutes: 15),
+    this.bankWaitLimit = const Duration(minutes: 10),
+    this.paymentPollInterval = const Duration(seconds: 30),
+    this.paymentWaitLimit = const Duration(minutes: 2),
+  });
+}
+
+class _Flow {
+  final String orderId;
+  final String consentId;
+  final String total;
+  DateTime consentDeadline;
+  bool reachedBank = false;
+
+  /// One key per payment attempt, reused on every retry of the create call,
+  /// including retries from later polling cycles and app resumes.
+  final String paymentIdempotencyKey;
+
+  String? paymentId;
+  DateTime? paymentDeadline;
+  DateTime? nextPaymentCheck;
+  bool cancelRequested = false;
+  bool creatingPayment = false;
+
+  _Flow({
+    required this.orderId,
+    required this.consentId,
+    required this.total,
+    required this.consentDeadline,
+    required this.paymentIdempotencyKey,
+  });
+}
+
+/// Runs a payment from consent creation to a final outcome.
+///
+/// It never revokes a consent or reports a failure on its own while the
+/// customer may still approve it or the payment is still in flight: only a
+/// terminal status from Blink Payments ends the flow. When the app stops
+/// checking first, the state is [PaymentState.unresolved].
 class PaymentManager extends ChangeNotifier {
-  final BlinkPayService _blinkPayService;
-  final ShoppingCartModel _cartModel;
+  final BlinkPayService _service;
+  final ShoppingCartModel _cart;
+  final Sleep _sleep;
+  final DateTime Function() _now;
+  final String Function() _newIdempotencyKey;
+  final PaymentTimings timings;
 
-  // Callbacks for UI interactions (passed from the screen)
-  // Note: BuildContext is obtained at call-time to avoid stale context issues
-  final Function(bool success, String message) showSnackBarCallback;
-  final Function(String message) handleApiErrorCallback;
-
-  // Internal State using Enum
   PaymentState _state = PaymentState.idle;
-  String?
-      _consentIdForVerification; // ID of the consent being actively processed
-  String?
-      _consentTypeForVerification; // Type ('single' or 'enduring') of the active consent
-  String?
-      _errorDetails; // Stores the user-friendly error message if state is error
-  bool _isCustomTabOpen = false; // Track if the custom tab is currently open
+  String? _message;
+  _Flow? _flow;
 
-  // Getters for UI
-  PaymentState get state => _state;
-  bool get isLoading =>
-      _state == PaymentState.creatingConsent ||
-      _state == PaymentState.verifying;
-  bool get isDisabled =>
-      _state == PaymentState.creatingConsent ||
-      _state == PaymentState.awaitingRedirect ||
-      _state == PaymentState.verifying;
-  String? get errorDetails => _errorDetails;
-  String? get consentIdForVerification => _consentIdForVerification;
-  String? get consentTypeForVerification => _consentTypeForVerification;
-  bool get isCustomTabOpen => _isCustomTabOpen;
+  /// Bumped whenever a flow starts or ends, so a check loop from an earlier
+  /// flow stops at its next step.
+  int _generation = 0;
+  int? _trackingGeneration;
 
   PaymentManager({
     required BlinkPayService blinkPayService,
     required ShoppingCartModel cartModel,
-    required this.showSnackBarCallback,
-    required this.handleApiErrorCallback,
-  })  : _blinkPayService = blinkPayService,
-        _cartModel = cartModel;
+    Sleep? sleep,
+    DateTime Function()? clock,
+    String Function()? newIdempotencyKey,
+    this.timings = const PaymentTimings(),
+  }) : _service = blinkPayService,
+       _cart = cartModel,
+       _sleep = sleep ?? Future<void>.delayed,
+       _now = clock ?? DateTime.now,
+       _newIdempotencyKey = newIdempotencyKey ?? (() => const Uuid().v4());
 
-  // ====== PAYMENT LOGIC METHODS ======
+  PaymentState get state => _state;
 
-  /// Updates the state and notifies listeners.
-  ///
-  /// Pass [_unchanged] (the default) to preserve the current value of a field.
-  /// Pass `null` to explicitly clear a field.
-  void _updateState(PaymentState newState,
-      {String? consentId = _unchanged,
-      String? consentType = _unchanged,
-      String? error = _unchanged,
-      bool? isCustomTabOpen}) {
-    bool changed = false;
+  /// Customer-facing text for the current state.
+  String? get message => _message;
 
-    if (_state != newState) {
-      _state = newState;
-      changed = true;
-      Log.info('Payment State changed to: $newState');
-    }
+  String? get consentId => _flow?.consentId;
 
-    // Update consent ID (skip if sentinel)
-    if (consentId != _unchanged && consentId != _consentIdForVerification) {
-      _consentIdForVerification = consentId;
-      changed = true;
-    }
+  bool get isBusy =>
+      _state == PaymentState.starting ||
+      _state == PaymentState.awaitingAuthorisation ||
+      _state == PaymentState.paymentProcessing;
 
-    // Update consent type (skip if sentinel)
-    if (consentType != _unchanged &&
-        consentType != _consentTypeForVerification) {
-      _consentTypeForVerification = consentType;
-      changed = true;
-    }
+  /// The customer can cancel only before the app starts creating a payment.
+  bool get canCancel =>
+      _state == PaymentState.awaitingAuthorisation &&
+      _flow?.paymentId == null &&
+      _flow?.cancelRequested == false &&
+      _flow?.creatingPayment == false;
 
-    // Update error (skip if sentinel)
-    if (error != _unchanged && error != _errorDetails) {
-      _errorDetails = error;
-      changed = true;
-    }
+  /// Creates an order and consent, and returns the URL to open in the in-app
+  /// browser, or null if it could not be created.
+  Future<String?> start(ConsentType type) async {
+    if (isBusy) return null;
+    final generation = ++_generation;
+    _flow = null;
+    _setState(PaymentState.starting, null);
 
-    if (isCustomTabOpen != null && _isCustomTabOpen != isCustomTabOpen) {
-      _isCustomTabOpen = isCustomTabOpen;
-      changed = true;
-    }
+    try {
+      final order = await _service.createOrder(_cart.quantity);
+      final consent = await _service.createConsent(
+        order.orderId,
+        type,
+        idempotencyKey: _newIdempotencyKey(),
+      );
+      if (generation != _generation) return null;
 
-    // Clear error details if not in error state
-    if (_state != PaymentState.error && _errorDetails != null) {
-      _errorDetails = null;
-      changed = true;
-    }
-    // Clear consent ID and type if idle
-    if (_state == PaymentState.idle &&
-        (_consentIdForVerification != null ||
-            _consentTypeForVerification != null)) {
-      _consentIdForVerification = null;
-      _consentTypeForVerification = null;
-      changed = true;
-    }
-
-    if (changed) {
-      notifyListeners();
-    }
-  }
-
-  /// Resets payment state to idle and notifies listeners.
-  void resetPaymentState() {
-    _updateState(PaymentState.idle,
-        consentId: null,
-        consentType: null,
-        error: null,
-        isCustomTabOpen: false);
-    _cartModel.reset(); // Reset the cart via the model
-    Log.info('State reset to idle');
-  }
-
-  /// Explicitly marks the custom tab as closed.
-  void setCustomTabClosed() {
-    if (_isCustomTabOpen) {
-      Log.info('Marking custom tab as closed.');
-      _isCustomTabOpen = false;
-      notifyListeners();
-    }
-  }
-
-  /// Checks the status of a payment consent after user returns to the app.
-  /// This typically happens after the deep link is received or the app is resumed.
-  Future<void> checkConsentStatus(String consentId, String flowType) async {
-    // Don't check if we are not in the awaiting redirect state for this specific consent
-    if (_state != PaymentState.awaitingRedirect ||
-        _consentIdForVerification != consentId) {
+      _flow = _Flow(
+        orderId: order.orderId,
+        consentId: consent.consentId,
+        total: order.total,
+        consentDeadline: _now().add(timings.gatewayWaitLimit),
+        paymentIdempotencyKey: _newIdempotencyKey(),
+      );
       Log.info(
-          'Skipping checkConsentStatus: State is $_state or consent ID mismatch ($_consentIdForVerification vs $consentId)');
+        'Consent ${consent.consentId} created for order ${order.orderId}',
+      );
+      _setState(PaymentState.awaitingAuthorisation, _awaitingMessage);
+      return consent.redirectUri;
+    } catch (e) {
+      Log.error('Could not start payment', e);
+      if (generation == _generation) {
+        _setState(PaymentState.failed, PaymentErrorHelper.forError(e));
+      }
+      return null;
+    }
+  }
+
+  /// Call once the in-app browser is open. Starts checking the consent.
+  void onBrowserOpened() => _ensureTracking();
+
+  /// The in-app browser could not be opened, so the customer never saw the
+  /// consent. Nobody can approve it, and it expires on its own.
+  void onBrowserFailed(Object error) {
+    Log.error('Could not open the payment page', error);
+    _endFlow(
+      PaymentState.failed,
+      'Could not open the payment page. No money has been taken.',
+    );
+  }
+
+  /// The bank or gateway sent the customer back to the app. The return URL
+  /// says nothing reliable about the outcome, even when it carries an
+  /// `error`, so the status is read rather than assumed.
+  void onReturnFromBank({String? consentId}) {
+    if (consentId != null && consentId != _flow?.consentId) {
+      Log.info('Ignoring return for another consent: $consentId');
       return;
     }
+    _resumeChecking();
+  }
 
-    Log.info('Checking consent status for ID: $consentId, type: $flowType');
-    _updateState(PaymentState.verifying, consentId: consentId);
+  /// The app came back to the foreground, perhaps from the banking app.
+  void onAppResumed() => _resumeChecking();
 
+  /// The customer asked to cancel before approving. Revokes the consent so it
+  /// cannot be approved later. If a payment already exists, keeps tracking it.
+  Future<void> cancel() async {
+    final flow = _flow;
+    if (!canCancel || flow == null) return;
+    flow.cancelRequested = true;
+    notifyListeners();
+
+    RevokeResult? result;
     try {
-      // Step 1: Get Consent Details from BlinkPay
-      Log.info('Fetching consent details...');
-      Map<String, dynamic> consentData;
-      if (flowType == 'single') {
-        consentData = await _blinkPayService.getSingleConsent(consentId);
-      } else if (flowType == 'enduring') {
-        consentData = await _blinkPayService.getEnduringConsent(consentId);
-      } else {
-        throw Exception('Unknown payment type: $flowType');
+      result = await _service.revokeConsent(flow.orderId);
+    } catch (e) {
+      Log.error('Could not revoke consent ${flow.consentId}', e);
+    }
+    if (flow != _flow) return;
+
+    if (result == RevokeResult.revoked ||
+        result == RevokeResult.alreadyRevoked) {
+      _endFlow(PaymentState.cancelled, PaymentErrorHelper.cancelled);
+      return;
+    }
+    flow.cancelRequested = false;
+    if (result == null) {
+      _setState(
+        PaymentState.awaitingAuthorisation,
+        "We couldn't cancel the payment. If you don't want to pay, don't "
+        'approve it with your bank.',
+      );
+    }
+    notifyListeners();
+    _ensureTracking();
+  }
+
+  /// Clears a finished, cancelled or unresolved flow.
+  void dismiss() {
+    if (isBusy) return;
+    _endFlow(PaymentState.idle, null);
+  }
+
+  void _resumeChecking() {
+    final flow = _flow;
+    if (flow == null) return;
+    if (_state == PaymentState.unresolved) {
+      _setState(
+        flow.paymentId == null
+            ? PaymentState.awaitingAuthorisation
+            : PaymentState.paymentProcessing,
+        flow.paymentId == null ? _awaitingMessage : _processingMessage,
+      );
+    }
+    if (isBusy) _ensureTracking();
+  }
+
+  Future<void> _ensureTracking() async {
+    if (_flow == null || _trackingGeneration == _generation) return;
+    final generation = _generation;
+    _trackingGeneration = generation;
+    try {
+      await _track(generation);
+    } finally {
+      if (_trackingGeneration == generation) _trackingGeneration = null;
+    }
+  }
+
+  bool _isStale(int generation) => generation != _generation;
+
+  Future<void> _track(int generation) async {
+    final flow = _flow!;
+
+    while (flow.paymentId == null) {
+      final (:body, :unreadable) = await _read(
+        () => _service.getConsent(flow.orderId),
+      );
+      if (_isStale(generation)) return;
+      if (unreadable) {
+        return _setState(PaymentState.unresolved, _unreadableMessage);
       }
 
-      Log.info('<<< Raw Consent Data Received: $consentData');
+      final status = body?['status'] as String?;
+      if (ConsentStatus.isFailed(status)) {
+        return _endFlow(
+          PaymentState.failed,
+          PaymentErrorHelper.forConsentStatus(status),
+        );
+      }
+      if (status == ConsentStatus.awaitingAuthorisation && !flow.reachedBank) {
+        flow.reachedBank = true;
+        final bankDeadline = _now().add(timings.bankWaitLimit);
+        if (bankDeadline.isAfter(flow.consentDeadline)) {
+          flow.consentDeadline = bankDeadline;
+        }
+      }
+      if (!flow.cancelRequested &&
+          (status == ConsentStatus.authorised ||
+              status == ConsentStatus.consumed)) {
+        // A payment from an earlier attempt shows up here: a single consent
+        // is Consumed by it, but an enduring one stays Authorised.
+        flow.paymentId = _firstPaymentId(body!);
+        if (flow.paymentId == null) await _createPayment(flow);
+      }
+      if (_isStale(generation)) return;
+      if (flow.paymentId != null) break;
 
-      // Check if the state changed while fetching
-      if (_consentIdForVerification != consentId) {
-        Log.info(
-            'Consent ID changed during fetch (Expected: $consentId, Current: $_consentIdForVerification). Aborting status check.');
+      if (!_now().isBefore(flow.consentDeadline)) {
+        return _setState(
+          PaymentState.unresolved,
+          "We haven't heard back from your bank yet. If you still approve "
+          'the payment, come back to this app to finish it.',
+        );
+      }
+      await _sleep(timings.consentPollInterval);
+      if (_isStale(generation)) return;
+    }
+
+    _setState(PaymentState.paymentProcessing, _processingMessage);
+    flow.paymentDeadline ??= _now().add(timings.paymentWaitLimit);
+    flow.nextPaymentCheck ??= _now().add(timings.paymentPollInterval);
+
+    while (true) {
+      final wait = flow.nextPaymentCheck!.difference(_now());
+      if (wait > Duration.zero) await _sleep(wait);
+      if (_isStale(generation)) return;
+
+      final (:body, :unreadable) = await _read(
+        () => _service.getPayment(flow.orderId, flow.paymentId!),
+      );
+      if (_isStale(generation)) return;
+      flow.nextPaymentCheck = _now().add(timings.paymentPollInterval);
+      if (unreadable) {
+        return _setState(PaymentState.unresolved, _unreadableMessage);
+      }
+
+      final status = body?['status'] as String?;
+      if (status == PaymentStatus.completed) {
+        _cart.reset();
+        return _endFlow(
+          PaymentState.succeeded,
+          'Payment of \$${flow.total} completed.',
+        );
+      }
+      if (status == PaymentStatus.rejected) {
+        return _endFlow(PaymentState.failed, PaymentErrorHelper.bankDeclined);
+      }
+      if (!_now().isBefore(flow.paymentDeadline!)) {
+        return _setState(
+          PaymentState.unresolved,
+          'Your bank is still processing the payment. You do not need to '
+          'pay again: the merchant will confirm it once it completes.',
+        );
+      }
+    }
+  }
+
+  /// Creates the payment, reusing the flow's idempotency key. Leaves
+  /// [_Flow.paymentId] null when the outcome is not known yet, so the next
+  /// check tries again with the same key.
+  Future<void> _createPayment(_Flow flow) async {
+    flow.creatingPayment = true;
+    notifyListeners();
+    try {
+      flow.paymentId = await _service.createPayment(
+        flow.orderId,
+        idempotencyKey: flow.paymentIdempotencyKey,
+      );
+      Log.info('Payment ${flow.paymentId} created');
+    } on BlinkPayNetworkException catch (e) {
+      Log.info('Payment create outcome unknown, will retry: $e');
+    } on BlinkPayApiException catch (e) {
+      // 2xx without an ID, 409 (an earlier request with this key, or on this
+      // consent, made or is making the payment) and BP002 (the consent is used
+      // up, maybe by that payment) all mean a payment may exist: the consent's
+      // payments will show it.
+      if (e.statusCode < 400 ||
+          e.statusCode == 409 ||
+          e.statusCode == 429 ||
+          e.statusCode >= 500 ||
+          e.code == 'BP002') {
+        Log.info('Payment create not confirmed, will re-check: $e');
         return;
       }
-
-      final status = consentData['status'];
-      Log.info('Consent status received: $status');
-
-      // Step 2: Check if Consent is Authorised
-      if (status == ConsentStatus.authorised) {
-        Log.info('Consent authorised. Proceeding to create payment...');
-
-        // Step 3: Create Payment Request with BlinkPay
-        String paymentId;
-        try {
-          Log.info('Creating payment...');
-          if (flowType == 'enduring') {
-            final pcr = PCR(
-              particulars: AppConstants.productName,
-              code: AppConstants.pcrCode,
-              reference: AppConstants.pcrReference,
-            );
-            paymentId = await _blinkPayService.createPayment(consentId,
-                pcr: pcr, amount: AppConstants.enduringAmount);
-          } else {
-            paymentId = await _blinkPayService.createPayment(consentId);
-          }
-          Log.info('<<< Payment creation initiated. Payment ID: $paymentId');
-
-          if (_state != PaymentState.verifying ||
-              _consentIdForVerification != consentId) {
-            throw Exception('Payment context changed during payment creation.');
-          }
-        } catch (e) {
-          Log.error('Failed to create payment', e);
-          throw Exception('Failed to create payment: ${e.toString()}');
-        }
-
-        // Step 4: Verify Payment Completion by Polling BlinkPay
-        Log.info('Waiting for payment ($paymentId) completion...');
-        bool paymentSuccessful;
-        try {
-          paymentSuccessful = await _blinkPayService.waitForPaymentCompletion(
-            consentId,
-            paymentId,
-            type: flowType,
-          );
-          Log.info(
-              'Payment completion status for $paymentId: $paymentSuccessful');
-        } catch (e) {
-          Log.error('Error during payment completion wait', e);
-          throw Exception('Error verifying payment status: ${e.toString()}');
-        }
-
-        // Double-check context hasn't changed
-        if (_state != PaymentState.verifying ||
-            _consentIdForVerification != consentId) {
-          throw Exception(
-              'Payment context changed during payment verification.');
-        }
-
-        if (!paymentSuccessful) {
-          throw Exception(
-              'Payment was not completed successfully or timed out');
-        }
-
-        // Step 5: Payment Success - Show Confirmation and Reset
-        Log.info('Payment successful!');
-        if (!_isCustomTabOpen) {
-          showSnackBarCallback(true, 'Payment completed successfully!');
-        }
-
-        resetPaymentState(); // Final state reached, reset everything
-      } else {
-        // Handle cases where consent is not authorised (e.g., Pending, Declined)
-        Log.info('Consent status was not Authorised: $status');
-
-        // Attempt to revoke if status is not Authorised and not already in a terminal failed/revoked state
-        if (status != ConsentStatus.rejected &&
-            status != ConsentStatus.revoked &&
-            status != ConsentStatus.gatewayTimeout) {
-          Log.info(
-              'Attempting to revoke consent $consentId due to non-authorised status ($status)');
-          bool revoked;
-          if (flowType == 'single') {
-            revoked = await _blinkPayService.revokeSingleConsent(consentId);
-          } else {
-            revoked = await _blinkPayService.revokeEnduringConsent(consentId);
-          }
-          Log.info('Revocation status for $consentId: $revoked');
-        }
-
-        throw Exception('Consent not authorised. Status: $status');
-      }
-    } catch (e, stacktrace) {
-      // Handle any errors during the status check process
-      final rawErrorMsg = e.toString();
-      Log.error('Payment check process error', e, stacktrace);
-
-      // Only update state if we are still verifying *this* consent
-      if (_state == PaymentState.verifying &&
-          _consentIdForVerification == consentId) {
-        final userFriendlyError =
-            PaymentErrorHelper.getUserFriendlyMessage(rawErrorMsg);
-        _updateState(PaymentState.error,
-            error: userFriendlyError,
-            consentId: consentId); // Keep consent ID for context if needed
-        showSnackBarCallback(false, userFriendlyError);
-      } else {
-        Log.info(
-            'Ignoring error for previous/changed payment operation (State: $_state, ID: $_consentIdForVerification).');
-      }
+      Log.error('Payment create rejected', e);
+      _endFlow(PaymentState.failed, PaymentErrorHelper.forError(e));
     } finally {
-      // Log.info('Entering finally block for checkConsentStatus. Current state: $_state, Consent ID: $_consentIdForVerification (Expected: $consentId)');
+      flow.creatingPayment = false;
+      if (flow == _flow) notifyListeners();
     }
   }
 
-  /// Marks the custom tab as open when URL launch begins
-  void markCustomTabOpen() {
-    if (_state == PaymentState.awaitingRedirect) {
-      _updateState(_state,
-          consentId: _consentIdForVerification,
-          consentType: _consentTypeForVerification,
-          isCustomTabOpen: true);
-    }
+  /// The payment made with this order's consent. Every order gets its own
+  /// consent here, so its payments are this order's. An app that reuses an
+  /// enduring consent across purchases must match on the payment ID instead.
+  ///
+  /// A refused request can leave a `Rejected` row ahead of the real payment
+  /// (the list is newest first), so a payment that is not rejected wins.
+  String? _firstPaymentId(Map<String, dynamic> consent) {
+    final payments = consent['payments'];
+    if (payments is! List || payments.isEmpty) return null;
+    final rows = payments.cast<Map<String, dynamic>>();
+    final chosen = rows.firstWhere(
+      (p) => p['status'] != PaymentStatus.rejected,
+      orElse: () => rows.first,
+    );
+    return chosen['payment_id'] as String?;
   }
 
-  /// Handles error when URL launch fails
-  void onLaunchError(String? consentId, String error) {
-    Log.error('Error launching URL for consent $consentId: $error');
-    _updateState(PaymentState.error,
-        error: 'Failed to open payment page.',
-        isCustomTabOpen: false,
-        consentId: consentId,
-        consentType: _consentTypeForVerification);
-    handleApiErrorCallback('Failed to open payment page.');
-  }
-
-  /// Handles payment button click: updates state and starts submission.
-  /// Returns the redirect URL if successful, null otherwise.
-  Future<String?> handleButtonClick(String type) async {
-    if (isLoading || isDisabled) {
-      Log.info('Ignoring button click: Already processing (State: $_state)');
-      return null;
-    }
-    Log.info('Button clicked: $type. Current State: $_state');
-
-    // Capture old consent details before clearing state, so _submitPayment
-    // can revoke the previous consent if one exists.
-    final oldConsentId = _consentIdForVerification;
-    final oldConsentType = _consentTypeForVerification;
-
-    _updateState(PaymentState.creatingConsent,
-        consentId: null, consentType: null, error: null);
-    return await _submitPayment(type, oldConsentId, oldConsentType);
-  }
-
-  /// Submits the initial request to BlinkPay to create a payment consent.
-  /// Returns the redirect URL if successful, null otherwise.
-  Future<String?> _submitPayment(
-      String buttonType, String? oldConsentId, String? oldConsentType) async {
-    // Revoke any existing consent before starting a new one
-    if (oldConsentId != null && oldConsentType != null) {
-      Log.info(
-          'Revoking previous consent ($oldConsentId - $oldConsentType) before starting new one.');
-      bool revoked;
-      if (oldConsentType == 'single') {
-        revoked = await _blinkPayService.revokeSingleConsent(oldConsentId);
-      } else {
-        revoked = await _blinkPayService.revokeEnduringConsent(oldConsentId);
-      }
-      Log.info('Previous consent revocation status: $revoked');
-    }
-
-    if (_state != PaymentState.creatingConsent) {
-      Log.error(
-          'Submit payment called in incorrect state: $_state. Expected creatingConsent.');
-      return null; // Should not happen if handleButtonClick is used
-    }
-
-    final total = _cartModel.total;
-    final totalAmount = total.toStringAsFixed(2);
-    // Enduring consent needs a max amount (e.g. double the initial)
-    // Single consent uses the exact amount.
-    final enduringMaxAmount = (total * 2).toStringAsFixed(2);
-    if (buttonType == 'single') {
-      Log.info('Initiating single consent for amount: $totalAmount');
-    } else {
-      Log.info(
-          'Initiating enduring consent with max amount: $enduringMaxAmount');
-    }
-
+  /// Reads a status. [body] is null after a transient failure (try again
+  /// later); [unreadable] means the backend cannot answer for this order.
+  Future<({Map<String, dynamic>? body, bool unreadable})> _read(
+    Future<Map<String, dynamic>> Function() read,
+  ) async {
     try {
-      // Step 1: Create Consent Request via BlinkPayService
-      Log.info('Creating consent request...');
-      Map<String, dynamic> paymentResponse;
-      final pcr = PCR(
-        particulars: AppConstants.productName,
-        code: AppConstants.pcrCode,
-        reference: AppConstants.pcrReference,
-      );
-
-      if (buttonType == 'single') {
-        paymentResponse =
-            await _blinkPayService.createSingleConsent(pcr, totalAmount);
-      } else if (buttonType == 'enduring') {
-        // Use enduring amount from constants if defined, else calculated max
-        final double constantEnduringAmount =
-            double.tryParse(AppConstants.enduringAmount) ?? 0.0;
-        final amountForEnduring = constantEnduringAmount > 0
-            ? constantEnduringAmount.toStringAsFixed(2)
-            : enduringMaxAmount;
-        paymentResponse = await _blinkPayService.createEnduringConsent(
-            amountForEnduring, amountForEnduring);
-      } else {
-        throw Exception('Unknown payment type selected: $buttonType');
-      }
-
-      final String? consentId = paymentResponse['consent_id'];
-      final String? redirectUri = paymentResponse['redirect_uri'];
-
-      if (consentId == null || consentId.isEmpty) {
-        throw Exception('No valid consent ID returned from consent creation');
-      }
-      if (redirectUri == null || redirectUri.isEmpty) {
-        throw Exception('No redirect URI provided by consent creation');
-      }
-      Log.info('Consent created ($consentId)');
-
-      // Double-check the flow wasn't cancelled while waiting for the API response
-      if (_state != PaymentState.creatingConsent) {
-        Log.info("Flow interrupted before redirect; aborting submitPayment.");
-        // If consent was created but flow cancelled, maybe try to revoke?
-        // For simplicity, just log and exit.
-        return null;
-      }
-
-      // Step 2: Update State - URL will be launched by caller
-      _updateState(PaymentState.awaitingRedirect,
-          consentId: consentId, consentType: buttonType); // Store type
-      Log.info('Redirect URI ready for launch');
-      return redirectUri; // Return URL for caller to launch
-    } catch (e, stacktrace) {
-      // Handle errors during consent creation
-      final rawErrorMsg = e.toString();
-      Log.error('Error initiating consent', e, stacktrace);
-      if (_state == PaymentState.creatingConsent) {
-        // Check if still in the creation phase
-        final userFriendlyError =
-            PaymentErrorHelper.getUserFriendlyMessage(rawErrorMsg);
-        _updateState(PaymentState.error,
-            error: userFriendlyError, consentId: null);
-        showSnackBarCallback(false, userFriendlyError);
-      } else {
-        Log.info(
-            'Ignoring initiation error for different/old attempt (State: $_state).');
-      }
-      return null;
+      return (body: await read(), unreadable: false);
+    } on BlinkPayApiException catch (e) {
+      Log.info('Status read failed: $e');
+      final transient = e.statusCode == 429 || e.statusCode >= 500;
+      return (body: null, unreadable: !transient);
+    } on BlinkPayNetworkException catch (e) {
+      Log.info('Status read failed: $e');
+      return (body: null, unreadable: false);
     }
+  }
+
+  String get _awaitingMessage =>
+      'Approve the payment of \$${_flow?.total} with your bank. You can '
+      'switch to your banking app and come back here.';
+
+  static const String _processingMessage =
+      'Payment submitted. Waiting for your bank to confirm it.';
+
+  static const String _unreadableMessage =
+      "We couldn't check this payment. Please check with the merchant "
+      'before paying again.';
+
+  void _endFlow(PaymentState state, String? message) {
+    _generation++;
+    _flow = null;
+    _setState(state, message);
+  }
+
+  void _setState(PaymentState state, String? message) {
+    if (_state == state && _message == message) return;
+    _state = state;
+    _message = message;
+    Log.info('Payment state: $state');
+    notifyListeners();
   }
 }

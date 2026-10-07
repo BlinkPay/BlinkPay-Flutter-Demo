@@ -8,8 +8,8 @@ import 'package:shelf_router/shelf_router.dart';
 import 'package:blinkpay_proxy_server/src/config.dart';
 import 'package:blinkpay_proxy_server/src/blinkpay_client.dart';
 import 'package:blinkpay_proxy_server/src/middleware/auth_middleware.dart';
-import 'package:blinkpay_proxy_server/src/routes/consent_routes.dart';
-import 'package:blinkpay_proxy_server/src/routes/payment_routes.dart';
+import 'package:blinkpay_proxy_server/src/orders.dart';
+import 'package:blinkpay_proxy_server/src/routes/order_routes.dart';
 
 void main() async {
   // ── Load configuration ─────────────────────────────────────────────
@@ -27,15 +27,14 @@ void main() async {
   final blinkPayClient = BlinkPayClient(config: config);
 
   // ── Build routes ───────────────────────────────────────────────────
-  //
-  // All BlinkPay proxy endpoints are mounted under /api/payments/v1/.
-  // The route handlers register paths relative to that mount point.
+  final orders = OrderStore(
+    unitPriceCents: Money.tryParseCents(config.unitPrice)!,
+  );
   final apiRouter = Router();
-  ConsentRoutes(blinkPayClient).addTo(apiRouter);
-  PaymentRoutes(blinkPayClient).addTo(apiRouter);
+  OrderRoutes(blinkPayClient, orders, config).addTo(apiRouter);
 
   final router = Router();
-  router.mount('/api/payments/v1/', apiRouter.call);
+  router.mount('/api/', apiRouter.call);
 
   // ── Apply middleware and serve ─────────────────────────────────────
   final handler = const Pipeline()
@@ -51,6 +50,7 @@ void main() async {
   print('========================================');
   print('  Listening on: http://${server.address.host}:${server.port}');
   print('  BlinkPay API: https://${config.blinkPayApiUrl}');
+  print('  Redirect URI: ${config.redirectUri}');
   print('========================================');
   print('');
 }

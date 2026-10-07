@@ -23,7 +23,8 @@ class BlinkPayClient {
   DateTime? _tokenExpiry;
   Future<String>? _tokenRefreshFuture;
 
-  BlinkPayClient({required this.config}) : _httpClient = http.Client();
+  BlinkPayClient({required this.config, http.Client? httpClient})
+    : _httpClient = httpClient ?? http.Client();
 
   /// Returns a valid access token, refreshing if expired.
   Future<String> _getToken() async {
@@ -55,8 +56,7 @@ class BlinkPayClient {
     _accessToken = null;
     _tokenExpiry = null;
 
-    final tokenUri =
-        Uri.https(config.blinkPayApiUrl, '/oauth2/token');
+    final tokenUri = Uri.https(config.blinkPayApiUrl, '/oauth2/token');
 
     final response = await _httpClient
         .post(
@@ -73,26 +73,25 @@ class BlinkPayClient {
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body) as Map<String, dynamic>;
       _accessToken = data['access_token'] as String;
-      _tokenExpiry =
-          DateTime.now().add(Duration(seconds: data['expires_in'] as int));
+      _tokenExpiry = DateTime.now().add(
+        Duration(seconds: data['expires_in'] as int),
+      );
       print('[BlinkPayClient] Access token refreshed successfully');
       return _accessToken!;
     }
 
-    throw Exception(
-      'Failed to get BlinkPay token: ${response.statusCode}',
-    );
+    throw Exception('Failed to get BlinkPay token: ${response.statusCode}');
   }
 
-  /// Forwards an HTTP request to the BlinkPay API.
+  /// Sends a request to the Blink Payments API with a valid Bearer token.
   ///
-  /// Automatically attaches a valid Bearer token. Returns the raw
-  /// [http.Response] so that route handlers can relay the status code
-  /// and body back to the Flutter app as-is.
+  /// Returns the raw [http.Response] so route handlers can relay the status
+  /// code, body and `Retry-After` back to the app.
   Future<http.Response> forward({
     required String method,
     required String path,
     String? body,
+    String? idempotencyKey,
   }) async {
     final token = await _getToken();
     final url = Uri.https(config.blinkPayApiUrl, path);
@@ -100,6 +99,7 @@ class BlinkPayClient {
     final headers = <String, String>{
       'Authorization': 'Bearer $token',
       if (body != null) 'Content-Type': 'application/json',
+      'idempotency-key': ?idempotencyKey,
     };
 
     final http.Response response;

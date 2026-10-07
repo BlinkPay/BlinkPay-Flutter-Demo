@@ -1,464 +1,245 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show HttpDate, HttpException;
+
 import 'package:http/http.dart' as http;
-import 'package:flutter/foundation.dart';
-import 'package:timezone/timezone.dart' as tz;
-import 'package:intl/intl.dart';
 
 import './env.dart';
+import './models/payment_models.dart';
+import './utils/log.dart';
 
-/// Payment status constants
-class PaymentStatus {
-  static const String completed = 'AcceptedSettlementCompleted';
-  static const String rejected = 'Rejected';
-  static const String pending = 'Pending';
-  static const String inProcess = 'AcceptedSettlementInProcess';
-}
+/// Waits for [duration]. Injected so tests can run retries and polling
+/// without real delays.
+typedef Sleep = Future<void> Function(Duration duration);
 
-/// Consent status constants
-class ConsentStatus {
-  static const String authorised = 'Authorised';
-  static const String awaitingAuthorisation = 'AwaitingAuthorisation';
-  static const String rejected = 'Rejected';
-  static const String revoked = 'Revoked';
-  static const String gatewayTimeout = 'GatewayTimeout';
-  static const String gatewayAwaitingSubmission = 'GatewayAwaitingSubmission';
-}
-
-/// Payment Clearing and Reconciliation information
-class PCR {
-  final String particulars;
+/// The backend answered with an error. [code] is the Blink Payments error
+/// code (`BPxxx`) relayed by the backend, or the backend's own code.
+class BlinkPayApiException implements Exception {
+  final int statusCode;
   final String? code;
-  final String? reference;
+  final String? message;
 
-  /// Creates a PCR object with required particulars and optional code and reference.
-  PCR({
-    required this.particulars,
-    this.code,
-    this.reference,
-  });
+  BlinkPayApiException(this.statusCode, {this.code, this.message});
 
-  // Ensure PCR values don't exceed maximum allowed length
-  String get truncatedParticulars => particulars.substring(0, particulars.length.clamp(0, 12));
-  String? get truncatedCode => code?.substring(0, code!.length.clamp(0, 12));
-  String? get truncatedReference => reference?.substring(0, reference!.length.clamp(0, 12));
-  
-  // Convert to a map for API requests
-  Map<String, dynamic> toJson() => {
-        'particulars': truncatedParticulars,
-        if (truncatedCode != null) 'code': truncatedCode,
-        if (truncatedReference != null) 'reference': truncatedReference,
-      };
-}
-
-/// Custom exception for payment check operations
-class PaymentCheckException implements Exception {
-  final String message;
-  PaymentCheckException(this.message);
+  factory BlinkPayApiException.fromResponse(http.Response response) {
+    Map<String, dynamic>? body;
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map<String, dynamic>) body = decoded;
+    } on FormatException {
+      body = null;
+    }
+    return BlinkPayApiException(
+      response.statusCode,
+      code: body?['code'] as String?,
+      message: body?['message'] as String?,
+    );
+  }
 
   @override
-  String toString() => message;
+  String toString() => 'BlinkPayApiException($statusCode, $code): $message';
 }
 
-/// Service for interacting with BlinkPay via the backend proxy server.
+/// The request may or may not have reached the backend: no response arrived.
+class BlinkPayNetworkException implements Exception {
+  final Object cause;
+
+  BlinkPayNetworkException(this.cause);
+
+  @override
+  String toString() => 'BlinkPayNetworkException: $cause';
+}
+
+/// Talks to this demo's backend, which holds the Blink Payments credentials
+/// and decides amounts and PCR. The app never sees a Blink Payments secret.
 ///
-/// All requests go to the proxy server at [Environment.backendUrl], which
-/// holds the BlinkPay client credentials and forwards requests with the
-/// appropriate OAuth2 token. This app never sees BlinkPay secrets.
+/// Retry policy: at most [maxRetries] retries. 5xx responses and network
+/// failures back off exponentially (0.5 s, then 1 s); a 429 waits for its
+/// `Retry-After`. Any other 4xx is never retried, because sending the same
+/// request again cannot fix it. A POST is only retried when it carries an
+/// idempotency key, so a retry can never create a second consent or payment.
 class BlinkPayService {
-  static const int maxStatusChecks = 10;
-  static const Duration checkInterval = Duration(seconds: 1);
   static const Duration apiTimeout = Duration(seconds: 30);
-  static const Duration retryDelay = Duration(seconds: 1);
-  static const int maxRetries = 3;
+  static const int maxRetries = 2;
+  static const Duration initialBackoff = Duration(milliseconds: 500);
 
-  /// Checks if an error is retryable (network errors, 5xx, 429)
-  bool _isRetryableError(dynamic error) {
-    final errorStr = error.toString().toLowerCase();
-    return errorStr.contains('timeout') ||
-           errorStr.contains('socket') ||
-           errorStr.contains('connection') ||
-           errorStr.contains('network') ||
-           errorStr.contains('status code 500') ||
-           errorStr.contains('status code 502') ||
-           errorStr.contains('status code 503') ||
-           errorStr.contains('status code 504') ||
-           errorStr.contains('status code 429');
+  /// A 429 asking us to wait longer than this is reported rather than waited
+  /// out with the customer watching a spinner.
+  static const Duration maxRetryAfter = Duration(seconds: 10);
+
+  final http.Client _client;
+  final Sleep _sleep;
+  final String _baseUrl;
+  final String _apiKey;
+
+  BlinkPayService({
+    http.Client? client,
+    Sleep? sleep,
+    String baseUrl = Environment.backendUrl,
+    String apiKey = Environment.appApiKey,
+  }) : _client = client ?? http.Client(),
+       _sleep = sleep ?? Future<void>.delayed,
+       _baseUrl = baseUrl,
+       _apiKey = apiKey;
+
+  /// Asks the backend to price the cart. Not retried: it has no idempotency
+  /// key, and the customer can simply tap again.
+  Future<CreatedOrder> createOrder(int quantity) async {
+    final json = await _send('POST', '/orders', body: {'quantity': quantity});
+    return CreatedOrder(
+      orderId: json['order_id'] as String,
+      total: (json['amount'] as Map<String, dynamic>)['total'] as String,
+    );
   }
 
-  /// Make an authenticated API request to the backend proxy server.
-  ///
-  /// The proxy server handles BlinkPay OAuth2 authentication. This method
-  /// only needs to include the app-to-server API key.
-  Future<Map<String, dynamic>> _makeApiRequest({
-    required String method,
-    required String endpoint,
-    Map<String, dynamic>? body,
+  /// Creates the consent for an order. [idempotencyKey] identifies this
+  /// attempt; retries reuse it.
+  Future<CreatedConsent> createConsent(
+    String orderId,
+    ConsentType type, {
+    required String idempotencyKey,
   }) async {
-    int attempt = 0;
+    final json = await _send(
+      'POST',
+      '/orders/$orderId/consent',
+      body: {'type': type.name},
+      idempotencyKey: idempotencyKey,
+    );
+    return CreatedConsent(
+      consentId: json['consent_id'] as String,
+      redirectUri: json['redirect_uri'] as String,
+    );
+  }
 
-    while (attempt < maxRetries) {
-      attempt++;
+  /// Reads the order's consent, including its embedded `payments`.
+  Future<Map<String, dynamic>> getConsent(String orderId) =>
+      _send('GET', '/orders/$orderId/consent');
 
-      try {
-        final url = '${Environment.backendUrl}/api$endpoint';
-
-        http.Response response;
-
-        // Authenticate with the backend proxy using the static API key.
-        // The proxy then authenticates with BlinkPay using OAuth2 — the
-        // mobile app never sees the BlinkPay client_id or client_secret.
-        final headers = <String, String>{
-          'Authorization': 'Bearer ${Environment.appApiKey}',
-          'Content-Type': 'application/json',
-        };
-
-        switch (method.toUpperCase()) {
-          case 'GET':
-            response = await http.get(
-              Uri.parse(url),
-              headers: headers,
-            ).timeout(apiTimeout);
-            break;
-          case 'POST':
-            response = await http.post(
-              Uri.parse(url),
-              headers: headers,
-              body: jsonEncode(body),
-            ).timeout(apiTimeout);
-            break;
-          case 'DELETE':
-            response = await http.delete(
-              Uri.parse(url),
-              headers: headers,
-            ).timeout(apiTimeout);
-            break;
-          default:
-            throw Exception('Unsupported method: $method');
-        }
-
-        // Special case for DELETE which returns no content
-        if (method.toUpperCase() == 'DELETE') {
-          if (response.statusCode == 204) {
-            return {'success': true};
-          } else if (response.statusCode == 409) {
-            return {'success': true, 'alreadyRevoked': true};
-          } else if (response.statusCode == 422) {
-            return {'success': false, 'completed': true};
-          }
-          // If DELETE returns other status codes, fall through to the general error handling
-        }
-
-        // Handle successful responses
-        if (response.statusCode == 200 || response.statusCode == 201) {
-          return jsonDecode(response.body);
-        }
-
-        // Handle error responses
-        final errorException = Exception(
-            'API request failed: Status code ${response.statusCode}');
-
-        // Retry on 5xx or 429
-        if ((response.statusCode >= 500 && response.statusCode < 600) ||
-            response.statusCode == 429) {
-          if (attempt < maxRetries) {
-            debugPrint('Retryable error (${response.statusCode}), attempt $attempt/$maxRetries');
-            await Future.delayed(retryDelay);
-            continue;
-          }
-        }
-
-        throw errorException;
-      } catch (e) {
-        debugPrint('API error ($method $endpoint), attempt $attempt/$maxRetries: $e');
-
-        // Retry on network errors
-        if (_isRetryableError(e) && attempt < maxRetries) {
-          debugPrint('Retrying after network error...');
-          await Future.delayed(retryDelay);
-          continue;
-        }
-
-        // No more retries or non-retryable error
-        rethrow;
-      }
+  /// Creates a payment against the order's consent and returns its ID.
+  ///
+  /// Use one [idempotencyKey] per payment attempt and send the same key on
+  /// every retry of that attempt: Blink Payments then returns the original
+  /// payment instead of creating a second one.
+  Future<String> createPayment(
+    String orderId, {
+    required String idempotencyKey,
+  }) async {
+    final json = await _send(
+      'POST',
+      '/orders/$orderId/payments',
+      body: const {},
+      idempotencyKey: idempotencyKey,
+    );
+    final paymentId = json['payment_id'];
+    if (paymentId is! String || paymentId.isEmpty) {
+      throw BlinkPayApiException(200, message: 'No payment_id in response');
     }
-
-    throw Exception('API request failed after $maxRetries attempts');
+    return paymentId;
   }
 
-  /// Create a single payment consent
-  Future<Map<String, dynamic>> createSingleConsent(
-      PCR pcr, String amount) async {
-    debugPrint('Creating BlinkPay single consent');
-    return _makeApiRequest(
-      method: 'POST',
-      endpoint: '/payments/v1/single-consents',
-      body: {
-        'flow': {
-          'detail': {
-            'type': 'gateway',
-            'redirect_uri': Environment.redirectUri,
-          }
-        },
-        'pcr': pcr.toJson(),
-        'amount': {
-          'total': amount,
-          'currency': 'NZD'
-        }
-      },
-    );
-  }
+  /// Reads a payment's status.
+  Future<Map<String, dynamic>> getPayment(String orderId, String paymentId) =>
+      _send('GET', '/orders/$orderId/payments/$paymentId');
 
-  /// Create an enduring (recurring) consent
-  Future<Map<String, dynamic>> createEnduringConsent(String maxAmountPeriod, String maxAmountPayment) async {
-    debugPrint('Creating BlinkPay enduring consent');
-
-    // Get current Auckland time
-    final auckland = tz.getLocation('Pacific/Auckland');
-    final nowInAuckland = tz.TZDateTime.now(auckland);
-    
-    // Format timestamp with timezone offset
-    final baseFormat = DateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS");
-    final baseFormatted = baseFormat.format(nowInAuckland);
-    
-    final offset = nowInAuckland.timeZoneOffset;
-    final hours = offset.inHours.abs().toString().padLeft(2, '0');
-    final minutes = (offset.inMinutes.abs() % 60).toString().padLeft(2, '0');
-    final sign = offset.isNegative ? '-' : '+';
-    final offsetStr = '$sign$hours:$minutes';
-    
-    final formattedDate = '$baseFormatted$offsetStr';
-    
-    return _makeApiRequest(
-      method: 'POST',
-      endpoint: '/payments/v1/enduring-consents',
-      body: {
-        'flow': {
-          'detail': {
-            'type': 'gateway',
-            'redirect_uri': Environment.redirectUri,
-          }
-        },
-        'maximum_amount_period': {
-          'total': maxAmountPeriod,
-          'currency': 'NZD'
-        },
-        'period': 'fortnightly',
-        'from_timestamp': formattedDate,
-        'maximum_amount_payment': {
-          'total': maxAmountPayment,
-          'currency': 'NZD'
-        }
-      },
-    );
-  }
-
-  /// Create a payment using a consent and return the payment ID
-  Future<String> createPayment(String consentId,
-      {PCR? pcr, String? amount}) async {
-    debugPrint('Creating BlinkPay payment for consent: $consentId');
-
-    final Map<String, dynamic> payload = {
-      'consent_id': consentId,
-      if (pcr != null && amount != null) ...{
-        'pcr': pcr.toJson(),
-        'amount': {
-          'total': amount,
-          'currency': 'NZD',
-        },
-      },
-    };
-
+  /// Revokes the order's consent.
+  Future<RevokeResult> revokeConsent(String orderId) async {
     try {
-      final response = await _makeApiRequest(
-        method: 'POST',
-        endpoint: '/payments/v1/payments',
-        body: payload,
-      );
-
-      // Handle different response formats - the API might return payment_id or id
-      // Ensure payment_id exists and is a string
-      final paymentId = response['payment_id'];
-      if (paymentId == null || paymentId is! String || paymentId.isEmpty) {
-        debugPrint(
-            'Error: Payment ID missing or invalid in response: $response');
-        throw Exception('Payment ID missing or invalid in API response');
+      await _send('DELETE', '/orders/$orderId/consent');
+      return RevokeResult.revoked;
+    } on BlinkPayApiException catch (e) {
+      if (e.statusCode == 409 && e.code == 'BP701') {
+        return RevokeResult.alreadyRevoked;
       }
-
-      debugPrint('Created payment with ID: $paymentId');
-      return paymentId; // Return the valid string ID
-    } catch (e) {
-      debugPrint('Error creating payment: $e');
-      // Rethrow the exception to be handled by the caller
+      // 409 otherwise means a payment is pending or active on the consent;
+      // 422 means the consent already ended, possibly because a payment was
+      // made with it. Either way a payment may exist, so the outcome must be
+      // read from the consent, not assumed.
+      if (e.statusCode == 409 || e.statusCode == 422) {
+        return RevokeResult.outcomeExists;
+      }
       rethrow;
     }
   }
 
-  /// Get details of a single consent
-  Future<Map<String, dynamic>> getSingleConsent(String consentId) async {
-    debugPrint('Retrieving BlinkPay single consent');
-    return _makeApiRequest(
-      method: 'GET',
-      endpoint: '/payments/v1/single-consents/$consentId',
-    );
-  }
+  Future<Map<String, dynamic>> _send(
+    String method,
+    String path, {
+    Map<String, dynamic>? body,
+    String? idempotencyKey,
+  }) async {
+    final uri = Uri.parse('$_baseUrl/api$path');
+    final retryable = method != 'POST' || idempotencyKey != null;
 
-  /// Get details of an enduring consent
-  Future<Map<String, dynamic>> getEnduringConsent(String consentId) async {
-    debugPrint('Retrieving BlinkPay enduring consent');
-    return _makeApiRequest(
-      method: 'GET',
-      endpoint: '/payments/v1/enduring-consents/$consentId',
-    );
-  }
-  
-  /// Revoke a single consent
-  Future<bool> revokeSingleConsent(String consentId) async {
-    debugPrint('Revoking BlinkPay single consent: $consentId');
-    try {
-      final response = await _makeApiRequest(
-        method: 'DELETE',
-        endpoint: '/payments/v1/single-consents/$consentId',
+    for (var attempt = 0; ; attempt++) {
+      final canRetry = retryable && attempt < maxRetries;
+      final request = http.Request(method, uri)
+        // DEMO ONLY: a static key. Production apps authenticate the customer.
+        ..headers['Authorization'] = 'Bearer $_apiKey'
+        ..headers['Content-Type'] = 'application/json';
+      if (idempotencyKey != null) {
+        request.headers['idempotency-key'] = idempotencyKey;
+      }
+      if (body != null) request.body = jsonEncode(body);
+
+      http.Response? response;
+      Object? noResponse;
+      try {
+        response = await http.Response.fromStream(
+          await _client.send(request).timeout(apiTimeout),
+        );
+      } on TimeoutException catch (e) {
+        noResponse = e;
+      } on http.ClientException catch (e) {
+        noResponse = e;
+      }
+      if (response == null) {
+        Log.info(
+          '$method $path: no response ($noResponse), '
+          'attempt ${attempt + 1}',
+        );
+        if (!canRetry) throw BlinkPayNetworkException(noResponse!);
+        await _sleep(_backoff(attempt));
+        continue;
+      }
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        if (response.body.isEmpty) return const {};
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+
+      final error = BlinkPayApiException.fromResponse(response);
+      Log.info(
+        '$method $path: ${response.statusCode} ${error.code}, '
+        'attempt ${attempt + 1}',
       );
-      // Check the success field based on _makeApiRequest DELETE handling
-      return response['success'] == true;
-    } catch (e) {
-      debugPrint('Error revoking single consent: $e');
-      // Consider if specific error types should be checked (e.g., 404 Not Found vs other errors)
-      return false; // Assume failure on any exception
+      final delay = canRetry ? _retryDelay(response, attempt) : null;
+      if (delay == null) throw error;
+      await _sleep(delay);
     }
   }
 
-  /// Revoke an enduring consent
-  Future<bool> revokeEnduringConsent(String consentId) async {
-    debugPrint('Revoking BlinkPay enduring consent: $consentId');
+  Duration _backoff(int attempt) => initialBackoff * (1 << attempt);
+
+  /// How long to wait before retrying [response], or null to give up.
+  Duration? _retryDelay(http.Response response, int attempt) {
+    if (response.statusCode == 429) {
+      final retryAfter = _parseRetryAfter(response.headers['retry-after']);
+      if (retryAfter == null) return _backoff(attempt);
+      return retryAfter > maxRetryAfter ? null : retryAfter;
+    }
+    return response.statusCode >= 500 ? _backoff(attempt) : null;
+  }
+
+  /// `Retry-After` is either whole seconds or an HTTP date.
+  Duration? _parseRetryAfter(String? value) {
+    if (value == null) return null;
+    final seconds = int.tryParse(value.trim());
+    if (seconds != null) return Duration(seconds: seconds < 0 ? 0 : seconds);
     try {
-      final response = await _makeApiRequest(
-        method: 'DELETE',
-        endpoint: '/payments/v1/enduring-consents/$consentId',
-      );
-      return response['success'] == true;
-    } catch (e) {
-      debugPrint('Error revoking enduring consent: $e');
-      return false;
-    }
-  }
-
-  /// Helper: Fetches consent data based on type.
-  Future<Map<String, dynamic>> _fetchConsentData(
-      String consentId, String type) async {
-    if (type == 'single') {
-      return await getSingleConsent(consentId);
-    } else if (type == 'enduring') {
-      return await getEnduringConsent(consentId);
-    } else {
-      throw Exception('Invalid consent type provided: $type');
-    }
-  }
-
-  /// Helper: Finds the specific payment map within the consent data's payment list.
-  Map<String, dynamic>? _findSpecificPayment(
-      Map<String, dynamic> consentData, String paymentId) {
-    final payments = consentData['payments'] as List<dynamic>?;
-    if (payments == null || payments.isEmpty) {
+      final wait = HttpDate.parse(value).difference(DateTime.now());
+      return wait.isNegative ? Duration.zero : wait;
+    } on HttpException {
       return null;
-    }
-
-    for (final payment in payments) {
-      final currentId = payment['payment_id'] ?? payment['id'];
-      if (currentId != null && currentId.toString() == paymentId) {
-        return payment; // Found the payment
-      }
-    }
-    return null; // Payment not found in the list
-  }
-
-  /// Check if a specific payment has been completed by polling until it reaches a terminal status
-  /// Returns true if completed, false otherwise (rejected, timed out, error).
-  /// If the check times out for a single consent, it attempts to revoke the consent.
-  Future<bool> waitForPaymentCompletion(String consentId, String paymentId,
-      {String type = 'single'}) async {
-    debugPrint(
-        'Waiting for payment $paymentId completion on consent $consentId (type: $type)');
-    int attempts = 0;
-
-    try {
-      while (attempts < maxStatusChecks) {
-        attempts++;
-        debugPrint(
-            'Checking payment status (attempt $attempts/$maxStatusChecks)');
-
-        try {
-          final consentData = await _fetchConsentData(consentId, type);
-          final specificPayment = _findSpecificPayment(consentData, paymentId);
-
-          if (specificPayment == null) {
-            debugPrint(
-                'Payment ID $paymentId not found yet (attempt $attempts).');
-            await Future.delayed(checkInterval);
-            continue; // Continue polling
-          }
-
-          final status = specificPayment['status'] as String?;
-          final foundPaymentId =
-              specificPayment['payment_id'] ?? specificPayment['id'];
-          debugPrint(
-              'Found payment $foundPaymentId status: $status (attempt $attempts)');
-
-          if (status == PaymentStatus.completed) {
-            debugPrint('Payment $foundPaymentId completed successfully.');
-            return true; // Success
-          } else if (status == PaymentStatus.rejected) {
-            debugPrint('Payment $foundPaymentId failed with status: $status.');
-            return false; // Explicit failure
-          }
-
-          // Other non-terminal statuses - keep waiting
-          await Future.delayed(checkInterval);
-
-        } catch (e) {
-          debugPrint('Error in status check attempt $attempts: $e');
-
-          // Retry on transient errors
-          if (_isRetryableError(e)) {
-            if (attempts < maxStatusChecks) {
-              debugPrint('Retryable error during payment verification, continuing...');
-              await Future.delayed(checkInterval);
-              continue;
-            }
-          }
-
-          // Non-retryable error or retries exhausted
-          return false;
-        }
-      } // End of while loop
-
-      // --- Loop Finished (Timeout) ---
-      debugPrint(
-          'Payment check timed out after $maxStatusChecks attempts for payment $paymentId.');
-
-      if (type == 'single') {
-        debugPrint(
-            'Attempting to revoke single consent $consentId due to timeout.');
-        try {
-          bool revoked = await revokeSingleConsent(consentId);
-          debugPrint(
-              'Single consent $consentId revocation attempt result: $revoked');
-        } catch (e) {
-          debugPrint(
-              'Error revoking single consent $consentId after timeout: $e');
-        }
-      } else {
-        debugPrint('Enduring consent $consentId not revoked on timeout.');
-      }
-
-      return false; // Failure due to timeout
-
-    } catch (e) {
-      debugPrint(
-          'Critical error during payment status check for consent $consentId: $e');
-      return false; // Failure due to critical error (e.g., initial consent fetch failed)
     }
   }
 }
