@@ -11,10 +11,7 @@ import '../utils/payment_error_helper.dart';
 
 /// Where the payment flow is.
 enum PaymentState {
-  /// Nothing in progress.
   idle,
-
-  /// Creating the order and consent.
   starting,
 
   /// The customer is at the gateway or their bank; checking the consent.
@@ -42,9 +39,14 @@ enum PaymentState {
 class PaymentTimings {
   final Duration consentPollInterval;
 
-  /// The Gateway gives a customer 15 minutes to choose a bank, and bank
-  /// authorisation windows are 4-10 minutes, so 15 minutes covers both.
-  final Duration consentWaitLimit;
+  /// The Gateway's session cutoff: how long the customer has to choose a
+  /// bank, counted from consent creation.
+  final Duration gatewayWaitLimit;
+
+  /// How long to keep checking once the customer has reached their bank.
+  /// The bank's own window (4-10 minutes, per bank and flow) starts then, so
+  /// this runs after the gateway time rather than inside it.
+  final Duration bankWaitLimit;
   final Duration paymentPollInterval;
 
   /// Settlement can take hours. The app watches for this long, then leaves
@@ -53,7 +55,8 @@ class PaymentTimings {
 
   const PaymentTimings({
     this.consentPollInterval = const Duration(seconds: 3),
-    this.consentWaitLimit = const Duration(minutes: 15),
+    this.gatewayWaitLimit = const Duration(minutes: 15),
+    this.bankWaitLimit = const Duration(minutes: 10),
     this.paymentPollInterval = const Duration(seconds: 30),
     this.paymentWaitLimit = const Duration(minutes: 2),
   });
@@ -63,7 +66,8 @@ class _Flow {
   final String orderId;
   final String consentId;
   final String total;
-  final DateTime consentDeadline;
+  DateTime consentDeadline;
+  bool reachedBank = false;
 
   /// One key per payment attempt, reused on every retry of the create call,
   /// including retries from later polling cycles and app resumes.
@@ -73,6 +77,7 @@ class _Flow {
   DateTime? paymentDeadline;
   DateTime? nextPaymentCheck;
   bool cancelRequested = false;
+  bool creatingPayment = false;
 
   _Flow({
     required this.orderId,
@@ -131,11 +136,12 @@ class PaymentManager extends ChangeNotifier {
       _state == PaymentState.awaitingAuthorisation ||
       _state == PaymentState.paymentProcessing;
 
-  /// The customer can cancel only before a payment has been created.
+  /// The customer can cancel only before the app starts creating a payment.
   bool get canCancel =>
       _state == PaymentState.awaitingAuthorisation &&
       _flow?.paymentId == null &&
-      _flow?.cancelRequested == false;
+      _flow?.cancelRequested == false &&
+      _flow?.creatingPayment == false;
 
   /// Creates an order and consent, and returns the URL to open in the in-app
   /// browser, or null if it could not be created.
@@ -158,7 +164,7 @@ class PaymentManager extends ChangeNotifier {
         orderId: order.orderId,
         consentId: consent.consentId,
         total: order.total,
-        consentDeadline: _now().add(timings.consentWaitLimit),
+        consentDeadline: _now().add(timings.gatewayWaitLimit),
         paymentIdempotencyKey: _newIdempotencyKey(),
       );
       Log.info(
@@ -224,6 +230,13 @@ class PaymentManager extends ChangeNotifier {
       return;
     }
     flow.cancelRequested = false;
+    if (result == null) {
+      _setState(
+        PaymentState.awaitingAuthorisation,
+        "We couldn't cancel the payment. If you don't want to pay, don't "
+        'approve it with your bank.',
+      );
+    }
     notifyListeners();
     _ensureTracking();
   }
@@ -280,13 +293,20 @@ class PaymentManager extends ChangeNotifier {
           PaymentErrorHelper.forConsentStatus(status),
         );
       }
-      if (!flow.cancelRequested) {
-        if (status == ConsentStatus.authorised) {
-          await _createPayment(flow);
-        } else if (status == ConsentStatus.consumed) {
-          flow.paymentId = _firstPaymentId(body!);
-          if (flow.paymentId == null) await _createPayment(flow);
+      if (status == ConsentStatus.awaitingAuthorisation && !flow.reachedBank) {
+        flow.reachedBank = true;
+        final bankDeadline = _now().add(timings.bankWaitLimit);
+        if (bankDeadline.isAfter(flow.consentDeadline)) {
+          flow.consentDeadline = bankDeadline;
         }
+      }
+      if (!flow.cancelRequested &&
+          (status == ConsentStatus.authorised ||
+              status == ConsentStatus.consumed)) {
+        // A payment from an earlier attempt shows up here: a single consent
+        // is Consumed by it, but an enduring one stays Authorised.
+        flow.paymentId = _firstPaymentId(body!);
+        if (flow.paymentId == null) await _createPayment(flow);
       }
       if (_isStale(generation)) return;
       if (flow.paymentId != null) break;
@@ -345,6 +365,8 @@ class PaymentManager extends ChangeNotifier {
   /// [_Flow.paymentId] null when the outcome is not known yet, so the next
   /// check tries again with the same key.
   Future<void> _createPayment(_Flow flow) async {
+    flow.creatingPayment = true;
+    notifyListeners();
     try {
       flow.paymentId = await _service.createPayment(
         flow.orderId,
@@ -354,10 +376,12 @@ class PaymentManager extends ChangeNotifier {
     } on BlinkPayNetworkException catch (e) {
       Log.info('Payment create outcome unknown, will retry: $e');
     } on BlinkPayApiException catch (e) {
-      // 409: an earlier request with this key, or on this consent, already
-      // made or is making the payment. BP002: the consent is used up, maybe by
-      // that payment. Either way the consent's payments will show it.
-      if (e.statusCode == 409 ||
+      // 2xx without an ID, 409 (an earlier request with this key, or on this
+      // consent, made or is making the payment) and BP002 (the consent is used
+      // up, maybe by that payment) all mean a payment may exist: the consent's
+      // payments will show it.
+      if (e.statusCode < 400 ||
+          e.statusCode == 409 ||
           e.statusCode == 429 ||
           e.statusCode >= 500 ||
           e.code == 'BP002') {
@@ -366,6 +390,9 @@ class PaymentManager extends ChangeNotifier {
       }
       Log.error('Payment create rejected', e);
       _endFlow(PaymentState.failed, PaymentErrorHelper.forError(e));
+    } finally {
+      flow.creatingPayment = false;
+      if (flow == _flow) notifyListeners();
     }
   }
 

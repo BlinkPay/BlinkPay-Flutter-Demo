@@ -94,7 +94,17 @@ class OrderRoutes {
     final response = await call;
     if (response == null || response.statusCode >= 300) {
       if (identical(order.consentCall, call)) order.consentCall = null;
-      return response == null ? _proxyError() : _relay(response);
+      if (response == null) return _proxyError();
+      // A plain 4xx created nothing, so the order may try again with a new
+      // key. After a 5xx or no response a consent may exist: keep the claim.
+      final status = response.statusCode;
+      if (status < 500 && status != 409 && status != 429) {
+        order
+          ..consentType = null
+          ..consentIdempotencyKey = null
+          ..consentRequest = null;
+      }
+      return _relay(response);
     }
     final json = _decode(response.body);
     order.consentId ??= json?['consent_id'] as String?;

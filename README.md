@@ -37,7 +37,7 @@ UNIT_PRICE=1.00
 
 In the [Merchant Portal](https://merchants.blinkpay.co.nz/settings/api), under Settings > API, add `blinkpaydemo://callback` to your redirect URIs, copy the client ID, and rotate and copy the secret.
 
-To try it in the sandbox, choose **PNZ** at the gateway and log in as `user01` with password `password`. The PNZ page lets you approve or decline.
+To try it in the sandbox, choose **PNZ** at the gateway and log in as `user01` with password `password`.
 
 <details>
 <summary>Manual setup (without run.sh)</summary>
@@ -137,7 +137,7 @@ The consent's `redirect_uri` is a custom scheme (`blinkpaydemo://callback`) regi
 The rules the app follows, from the Blink Payments consent and payment lifecycle docs:
 
 - **Only `AcceptedSettlementCompleted` means paid; `Rejected` means failed.** `Pending` and `AcceptedSettlementInProcess` mean the payment is in flight. A `Consumed` consent only means a payment was made with it, not that the payment succeeded.
-- **Waiting for the customer is not a failure.** While the consent is `GatewayAwaitingSubmission` or `AwaitingAuthorisation`, the customer may still approve it, perhaps in their banking app. The app checks the consent **no more often than every 3 seconds** until it reaches a terminal status. It never revokes it or reports a failure on its own. Bank authorisation windows are 4 to 10 minutes, and the gateway gives the customer 15 minutes to choose a bank, so the app keeps checking for 15 minutes.
+- **Waiting for the customer is not a failure.** While the consent is `GatewayAwaitingSubmission` or `AwaitingAuthorisation`, the customer may still approve it, perhaps in their banking app. The app checks the consent **no more often than every 3 seconds** until it reaches a terminal status. It never revokes it or reports a failure on its own. The gateway gives the customer 15 minutes to choose a bank, and only then does the bank's own authorisation window (4 to 10 minutes) start, so the app keeps checking for 15 minutes and for at least 10 minutes after the consent reaches the bank. If it still has no answer, it says so and stops, without treating the payment as failed.
 - **Settlement takes time.** Once the payment exists the app checks it **every 30 seconds** for up to 2 minutes. Settlement usually takes 1 to 2 hours and, late in the day, can wait until the next morning. If the payment has not settled by then, the app shows that it is still processing and stops. It does not revoke anything or call it failed.
 - **The backend decides the final outcome.** Mobile apps get closed. A production backend keeps polling the payment every 30 to 60 seconds, and runs a periodic wash-up over payments still `Pending` or `AcceptedSettlementInProcess` (every 12 hours is a sensible default), before marking orders paid.
 - **The customer can cancel before approving.** Cancel revokes the consent so it cannot be approved later. If the revoke is refused because a payment already exists (`409`) or the consent has already ended (`422`), the app reads the outcome instead of assuming it.
@@ -145,7 +145,7 @@ The rules the app follows, from the Blink Payments consent and payment lifecycle
 ## Retries and Idempotency
 
 - **One idempotency key per payment attempt.** The app sends a fresh UUID in the `idempotency-key` header when it creates a consent or a payment, and the backend forwards it to Blink Payments. Every retry of that attempt reuses the same key, including retries from a later check or after the app resumes, so a timeout followed by a retry returns the original payment instead of creating a second one.
-- **At most 2 retries.** `5xx` responses and network failures back off exponentially (0.5 s, then 1 s). A `429` waits for its `Retry-After` header. Any other `4xx` is never retried, because sending the same request again cannot fix it. A POST is only retried when it carries an idempotency key.
+- **At most 2 retries.** `5xx` responses and network failures back off exponentially (0.5 s, then 1 s). A `429` waits for its `Retry-After` header, or gives up if that is longer than 10 seconds rather than keep the customer waiting. Any other `4xx` is never retried, because sending the same request again cannot fix it. A POST is only retried when it carries an idempotency key.
 - **Messages come from the error code.** Blink Payments errors carry a `code` such as `BP214` or `BP036`. The app chooses the customer's message from that code, then from the HTTP status, and never from the wording of the `message`.
 
 ## Deep Linking Setup

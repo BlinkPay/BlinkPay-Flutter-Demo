@@ -8,10 +8,6 @@ class ConsentStatus {
   static const String revoked = 'Revoked';
   static const String gatewayTimeout = 'GatewayTimeout';
 
-  /// The customer has not finished at the gateway or the bank yet.
-  static bool isAwaitingCustomer(String? status) =>
-      status == gatewayAwaitingSubmission || status == awaitingAuthorisation;
-
   /// The consent ended without a payment.
   static bool isFailed(String? status) =>
       status == rejected || status == revoked || status == gatewayTimeout;
