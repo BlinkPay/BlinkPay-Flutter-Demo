@@ -396,10 +396,21 @@ class PaymentManager extends ChangeNotifier {
     }
   }
 
+  /// The payment made with this order's consent. Every order gets its own
+  /// consent here, so its payments are this order's. An app that reuses an
+  /// enduring consent across purchases must match on the payment ID instead.
+  ///
+  /// A refused request can leave a `Rejected` row ahead of the real payment
+  /// (the list is newest first), so a payment that is not rejected wins.
   String? _firstPaymentId(Map<String, dynamic> consent) {
     final payments = consent['payments'];
     if (payments is! List || payments.isEmpty) return null;
-    return (payments.first as Map<String, dynamic>)['payment_id'] as String?;
+    final rows = payments.cast<Map<String, dynamic>>();
+    final chosen = rows.firstWhere(
+      (p) => p['status'] != PaymentStatus.rejected,
+      orElse: () => rows.first,
+    );
+    return chosen['payment_id'] as String?;
   }
 
   /// Reads a status. [body] is null after a transient failure (try again
