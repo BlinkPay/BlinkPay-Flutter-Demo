@@ -63,54 +63,49 @@ class OrderRoutes {
 
     final key = request.headers['idempotency-key'];
     if (key == null || !_uuid.hasMatch(key)) return _missingIdempotencyKey();
-
-    if (order.consentIdempotencyKey != null &&
-        order.consentIdempotencyKey != key) {
-      return _error(
-        409,
-        'consent_exists',
-        'This order already has a consent. Create a new order to start again.',
-      );
-    }
-    if (order.consentId != null) {
-      return _json(201, {
-        'consent_id': order.consentId,
-        'redirect_uri': order.gatewayRedirectUri,
-      });
-    }
-
-    final body = await _readJson(request);
-    final type = body?['type'];
+    final type = (await _readJson(request))?['type'];
     if (type != 'single' && type != 'enduring') {
       return _error(400, 'invalid_type', 'type must be "single" or "enduring"');
     }
-    if (order.consentType != null && order.consentType != type) {
+
+    // Nothing awaits from here until the upstream call is shared, so
+    // concurrent requests for this order always see each other's claim.
+    if ((order.consentIdempotencyKey ?? key) != key ||
+        (order.consentType ?? type) != type) {
       return _error(
         409,
         'consent_exists',
         'This order already has a consent. Create a new order to start again.',
       );
     }
+    if (order.consentId != null) return _consentCreated(order);
 
-    order.consentType = type;
+    order.consentType = type as String;
     order.consentIdempotencyKey = key;
-    order.consentRequest ??= _consentRequest(order, type as String);
-
-    return _forward(
+    order.consentRequest ??= _consentRequest(order, type);
+    // A retry or double tap while the first request is in flight waits for
+    // that call instead of creating a second consent.
+    final call = order.consentCall ??= _send(
       method: 'POST',
       path: '/payments/v1/${_consentPath(order)}',
-      body: order.consentRequest,
+      body: jsonEncode(order.consentRequest),
       idempotencyKey: key,
-      onSuccess: (json) {
-        order.consentId = json['consent_id'] as String?;
-        order.gatewayRedirectUri = json['redirect_uri'] as String?;
-        return {
-          'consent_id': order.consentId,
-          'redirect_uri': order.gatewayRedirectUri,
-        };
-      },
     );
+    final response = await call;
+    if (response == null || response.statusCode >= 300) {
+      if (identical(order.consentCall, call)) order.consentCall = null;
+      return response == null ? _proxyError() : _relay(response);
+    }
+    final json = _decode(response.body);
+    order.consentId ??= json?['consent_id'] as String?;
+    order.gatewayRedirectUri ??= json?['redirect_uri'] as String?;
+    return _consentCreated(order);
   }
+
+  Response _consentCreated(Order order) => _json(201, {
+    'consent_id': order.consentId,
+    'redirect_uri': order.gatewayRedirectUri,
+  });
 
   Future<Response> _getConsent(Request request, String orderId) async {
     final order = _orders.find(orderId);
@@ -159,9 +154,8 @@ class OrderRoutes {
     String paymentId,
   ) async {
     final order = _orders.find(orderId);
-    if (order?.consentId == null || !_uuid.hasMatch(paymentId)) {
-      return _orderNotFound();
-    }
+    if (order?.consentId == null) return _orderNotFound();
+    if (!_uuid.hasMatch(paymentId)) return _paymentNotFound();
     final response = await _send(
       method: 'GET',
       path: '/payments/v1/payments/$paymentId',
@@ -169,7 +163,7 @@ class OrderRoutes {
     if (response == null) return _proxyError();
     if (response.statusCode == 200 &&
         _decode(response.body)?['detail']?['consent_id'] != order!.consentId) {
-      return _error(404, 'payment_not_found', 'No such payment on this order');
+      return _paymentNotFound();
     }
     return _relay(response);
   }
@@ -195,14 +189,12 @@ class OrderRoutes {
   String _consentPath(Order order) =>
       order.consentType == 'enduring' ? 'enduring-consents' : 'single-consents';
 
-  /// Sends to Blink Payments and relays the response. A 2xx JSON body goes
-  /// through [onSuccess] first when given.
+  /// Sends to Blink Payments and relays the response.
   Future<Response> _forward({
     required String method,
     required String path,
     Map<String, dynamic>? body,
     String? idempotencyKey,
-    Map<String, dynamic> Function(Map<String, dynamic> json)? onSuccess,
   }) async {
     final response = await _send(
       method: method,
@@ -210,14 +202,7 @@ class OrderRoutes {
       body: body == null ? null : jsonEncode(body),
       idempotencyKey: idempotencyKey,
     );
-    if (response == null) return _proxyError();
-    if (onSuccess != null &&
-        response.statusCode >= 200 &&
-        response.statusCode < 300) {
-      final json = _decode(response.body);
-      if (json != null) return _json(response.statusCode, onSuccess(json));
-    }
-    return _relay(response);
+    return response == null ? _proxyError() : _relay(response);
   }
 
   Future<http.Response?> _send({
@@ -277,6 +262,9 @@ class OrderRoutes {
 
   Response _orderNotFound() =>
       _error(404, 'order_not_found', 'No such order, or it has no consent yet');
+
+  Response _paymentNotFound() =>
+      _error(404, 'payment_not_found', 'No such payment on this order');
 
   Response _missingIdempotencyKey() => _error(
     400,

@@ -1,3 +1,4 @@
+import 'package:http/http.dart' as http;
 import 'package:uuid/uuid.dart';
 
 import 'config.dart';
@@ -20,6 +21,7 @@ class Order {
   /// original response instead of rejecting the key (BP702).
   String? consentIdempotencyKey;
   Map<String, dynamic>? consentRequest;
+  Future<http.Response?>? consentCall;
   String? consentId;
   String? gatewayRedirectUri;
 
